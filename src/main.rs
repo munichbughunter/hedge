@@ -1,18 +1,13 @@
+mod config;
+
 fn main() {
-    println!("Hello, world!");
-    println!("{}", greeting("Patrick"));
-}
-
-fn greeting(name: &str) -> String {
-    format!("Hallo, {}!", name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn greeting_contains_name() {
-        assert_eq!(greeting("Patrick"), "Hallo, Patrick!")
+    match config::Config::load("hedge.toml") {
+        Ok(cfg) => {
+            println!("{:#?}", cfg)
+        }
+        Err(e) => {
+            eprintln!("hedge: Configuration can not be loaded: {e}");
+            std::process::exit(1);
+        }
     }
 }

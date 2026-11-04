@@ -1,0 +1,12 @@
+mode = "observe"
+
+[server]
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "anthropic"
+url = "https://api.anthropic.com"
+
+[[upstreams]]
+name = "openai"
+url = "https://api.openai.com"
