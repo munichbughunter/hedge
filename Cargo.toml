@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.9"
+regex = "1.13.1"
 reqwest = "0.13.5"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
