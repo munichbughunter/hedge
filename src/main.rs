@@ -1,5 +1,6 @@
 mod config;
 mod detect;
+mod policy;
 mod proxy;
 
 use std::sync::Arc;
