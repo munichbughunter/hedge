@@ -1,5 +1,7 @@
 mod config;
+mod detect;
 mod proxy;
+
 use std::sync::Arc;
 
 use axum::{
