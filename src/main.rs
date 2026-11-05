@@ -1,15 +1,13 @@
 mod config;
-use axum::{
-    Router,
-    extract::{Path, State},
-    http::StatusCode,
-    routing::{any, get},
-};
+mod proxy;
 use std::sync::Arc;
 
-struct AppState {
-    cfg: config::Config,
-}
+use axum::{
+    Router,
+    routing::{any, get},
+};
+
+use proxy::AppState;
 
 #[tokio::main]
 async fn main() {
@@ -24,36 +22,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(&cfg.server.listen).await?;
 
-    let state = Arc::new(AppState { cfg });
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let state = Arc::new(AppState::new(cfg, client));
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/{upstream}/{*rest}", any(proxy))
+        .route("/{upstream}/{*rest}", any(proxy::proxy))
         .with_state(state);
 
-    //println!("hedge listening on {}", cfg.server.listen);
+    println!("hedge listening on {}", listener.local_addr()?);
 
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn proxy(
-    State(state): State<Arc<AppState>>,
-    Path((upstream, rest)): Path<(String, String)>,
-) -> Result<String, (StatusCode, String)> {
-    let selected = state.cfg.upstreams.iter().find(|u| u.name == upstream);
-
-    match selected {
-        Some(target) => Ok(format!(
-            "would forward to {}/{}",
-            target.url.trim_end_matches('/'),
-            rest
-        )),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            format!("unknown upstream: {upstream}"),
-        )),
-    }
 }
 
 async fn health() -> &'static str {
