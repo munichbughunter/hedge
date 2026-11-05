@@ -127,9 +127,40 @@ impl Detector for PiiDetector {
     }
 }
 
+/// Sammlung aller aktiven Detektoren. Der Proxy kennt nur diese Struktur,
+/// nicht die einzelnen Detektoren dahinter.
+pub struct Detectors {
+    detectors: Vec<Box<dyn Detector>>,
+}
+
+impl Detectors {
+    pub fn new(detectors: Vec<Box<dyn Detector>>) -> Self {
+        Self { detectors }
+    }
+
+    /// Die Standard-Detektoren von Hedge.
+    pub fn default_set() -> Self {
+        Self::new(vec![Box::new(SecretDetector), Box::new(PiiDetector)])
+    }
+
+    /// Lässt alle Detektoren laufen, Ergebnis nach Position sortiert.
+    /// Funde verschiedener Detektoren dürfen sich überlappen; das
+    /// Zusammenführen von Bereichen ist Sache des Redactors.
+    pub fn scan(&self, text: &str) -> Vec<Finding> {
+        let mut findings: Vec<Finding> = self
+            .detectors
+            .iter()
+            .flat_map(|detector| detector.scan(text))
+            .collect();
+
+        findings.sort_by_key(|f| f.start);
+        findings
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Detector, PiiDetector, SecretDetector, Severity};
+    use super::{Detector, Detectors, Finding, PiiDetector, SecretDetector, Severity};
 
     // Generated placeholders only; these are not real API keys.
     fn fake_key(character: char, length: usize) -> String {
@@ -253,5 +284,58 @@ mod tests {
     fn iban_inside_longer_digit_run_does_not_match() {
         let findings = PiiDetector.scan("XXDE89370400440532013000999");
         assert!(findings.is_empty(), "got: {findings:?}");
+    }
+
+    #[test]
+    fn default_set_runs_all_detectors_in_text_order() {
+        let email = "max@example.org";
+        let key = fake_key('x', 20);
+        let text = format!("{email} und {key}");
+
+        let findings = Detectors::default_set().scan(&text);
+
+        assert_eq!(findings.len(), 2, "got: {findings:?}");
+        assert_eq!(findings[0].detector, "pii");
+        assert_eq!(&text[findings[0].start..findings[0].end], email);
+        assert_eq!(findings[1].detector, "secrets");
+        assert_eq!(&text[findings[1].start..findings[1].end], key);
+    }
+
+    /// Beweist, dass jeder Typ, der den Detector-Vertrag erfüllt,
+    /// in die Sammlung passt – auch einer, den detect.rs nicht kennt.
+    struct AlwaysFinds;
+
+    impl Detector for AlwaysFinds {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn scan(&self, _text: &str) -> Vec<Finding> {
+            vec![Finding {
+                detector: self.name(),
+                kind: "always",
+                severity: Severity::Low,
+                start: 0,
+                end: 1,
+            }]
+        }
+    }
+
+    #[test]
+    fn any_detector_implementation_can_be_plugged_in() {
+        let detectors = Detectors::new(vec![Box::new(AlwaysFinds)]);
+
+        let findings = detectors.scan("irgendwas");
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].detector, "test");
+        assert_eq!(findings[0].kind, "always");
+    }
+
+    #[test]
+    fn empty_set_finds_nothing() {
+        let detectors = Detectors::new(vec![]);
+
+        assert!(detectors.scan(&fake_key('x', 20)).is_empty());
     }
 }
