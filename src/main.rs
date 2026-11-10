@@ -1,48 +1,29 @@
-mod config;
-mod detect;
-mod inspect;
-mod policy;
-mod proxy;
-
-use std::sync::Arc;
-
-use axum::{
-    Router,
-    routing::{any, get},
-};
-
-use proxy::AppState;
+use clap::Parser;
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = run().await {
-        eprintln!("hedge: {e}");
-        std::process::exit(1);
+    reset_sigpipe();
+    let cli = hedge::cli::Cli::parse();
+    match hedge::cli::run(cli).await {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("hedge: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = config::Config::load("hedge.toml")?;
-
-    let listener = tokio::net::TcpListener::bind(&cfg.server.listen).await?;
-
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-
-    let state = Arc::new(AppState::new(cfg, client));
-
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/{upstream}/{*rest}", any(proxy::proxy))
-        .with_state(state);
-
-    println!("hedge listening on {}", listener.local_addr()?);
-
-    axum::serve(listener, app).await?;
-    Ok(())
+/// Rust ignoriert SIGPIPE und lässt `println!` stattdessen panicken. Für ein
+/// CLI, dessen Ausgabe in `head`, `grep` oder `less` landet, ist das falsche
+/// Verhalten: `hedge tail | head` soll leise enden, nicht abstürzen.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: Setzt nur den prozessweiten Handler für SIGPIPE auf den
+    // Standard zurück; kein Zugriff auf geteilten Speicher.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }
 
-async fn health() -> &'static str {
-    "healthy"
-}
+#[cfg(not(unix))]
+fn reset_sigpipe() {}

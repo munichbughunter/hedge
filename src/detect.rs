@@ -1,11 +1,50 @@
+//! Detektoren: finden Secrets und PII in Text und melden Byte-Offsets.
+//!
+//! Ein `Finding` trägt nie den gefundenen Text selbst, nur wo er steht.
+//! Wer ihn braucht (der Redactor), holt ihn explizit mit `&text[start..end]`.
+
 use regex::Regex;
+use serde::Deserialize;
 use std::sync::LazyLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Schwere eines Funds. Die Reihenfolge ist die Ordnung: Low < Medium < High.
+///
+/// Bedeutung in der Policy: Low = nur melden/maskieren, nie blockieren;
+/// Medium = maskieren; High = blockieren (im Block-Modus).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     Low,
     Medium,
     High,
+}
+
+impl Severity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Low => "low",
+            Severity::Medium => "medium",
+            Severity::High => "high",
+        }
+    }
+}
+
+/// Klartext für Menschen. `kind` bleibt der stabile, maschinenlesbare Bezeichner.
+pub fn describe_kind(kind: &str) -> &str {
+    match kind {
+        "anthropic_api_key" => "Anthropic API key",
+        "openai_api_key" => "OpenAI API key",
+        "aws_access_key_id" => "AWS access key ID",
+        "github_token" => "GitHub token",
+        "gitlab_token" => "GitLab token",
+        "slack_token" => "Slack token",
+        "google_api_key" => "Google API key",
+        "private_key" => "private key block",
+        "jwt" => "JSON Web Token",
+        "email" => "e-mail address",
+        "iban_de" => "German IBAN",
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +90,36 @@ static SECRET_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             kind: "openai_api_key",
             severity: Severity::High,
             regex: re(r"sk-[A-Za-z0-9_-]{20,}"),
+        },
+        Pattern {
+            kind: "github_token",
+            severity: Severity::High,
+            regex: re(r"gh[pousr]_[A-Za-z0-9]{36}"),
+        },
+        Pattern {
+            kind: "gitlab_token",
+            severity: Severity::High,
+            regex: re(r"glpat-[A-Za-z0-9_-]{20,}"),
+        },
+        Pattern {
+            kind: "slack_token",
+            severity: Severity::High,
+            regex: re(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+        },
+        Pattern {
+            kind: "google_api_key",
+            severity: Severity::High,
+            regex: re(r"AIza[0-9A-Za-z_-]{35}"),
+        },
+        Pattern {
+            kind: "private_key",
+            severity: Severity::High,
+            regex: re(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+        },
+        Pattern {
+            kind: "jwt",
+            severity: Severity::Medium,
+            regex: re(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
         },
     ]
 });
@@ -141,6 +210,22 @@ impl Detectors {
     /// Die Standard-Detektoren von Hedge.
     pub fn default_set() -> Self {
         Self::new(vec![Box::new(SecretDetector), Box::new(PiiDetector)])
+    }
+
+    /// Detektoren laut Config-Schaltern.
+    pub fn from_toggles(toggles: &crate::config::DetectorToggles) -> Self {
+        let mut list: Vec<Box<dyn Detector>> = Vec::new();
+        if toggles.secrets {
+            list.push(Box::new(SecretDetector));
+        }
+        if toggles.pii {
+            list.push(Box::new(PiiDetector));
+        }
+        Self::new(list)
+    }
+
+    pub fn names(&self) -> Vec<&'static str> {
+        self.detectors.iter().map(|d| d.name()).collect()
     }
 
     /// Lässt alle Detektoren laufen, Ergebnis nach Position sortiert.
@@ -337,5 +422,48 @@ mod tests {
         let detectors = Detectors::new(vec![]);
 
         assert!(detectors.scan(&fake_key('x', 20)).is_empty());
+    }
+
+    #[test]
+    fn additional_secret_patterns_match_examples() {
+        let cases = [
+            ("ghp_".to_owned() + &"a".repeat(36), "github_token"),
+            ("glpat-".to_owned() + &"b".repeat(20), "gitlab_token"),
+            ("xoxb-1234567890-abc".to_owned(), "slack_token"),
+            ("AIza".to_owned() + &"c".repeat(35), "google_api_key"),
+            ("-----BEGIN RSA PRIVATE KEY-----".to_owned(), "private_key"),
+            (
+                format!(
+                    "eyJ{}.eyJ{}.{}",
+                    "a".repeat(10),
+                    "b".repeat(10),
+                    "c".repeat(10)
+                ),
+                "jwt",
+            ),
+        ];
+        for (text, kind) in cases {
+            let findings = SecretDetector.scan(&text);
+            assert_eq!(findings.len(), 1, "{kind}: {findings:?}");
+            assert_eq!(findings[0].kind, kind);
+        }
+    }
+
+    #[test]
+    fn toggles_select_detectors() {
+        use crate::config::DetectorToggles;
+
+        let only_pii = Detectors::from_toggles(&DetectorToggles {
+            secrets: false,
+            pii: true,
+        });
+        assert_eq!(only_pii.names(), vec!["pii"]);
+        assert!(only_pii.scan(&fake_key('x', 20)).is_empty());
+
+        let none = Detectors::from_toggles(&DetectorToggles {
+            secrets: false,
+            pii: false,
+        });
+        assert!(none.names().is_empty());
     }
 }
