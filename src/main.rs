@@ -1,5 +1,6 @@
 mod config;
 mod detect;
+mod inspect;
 mod policy;
 mod proxy;
 
