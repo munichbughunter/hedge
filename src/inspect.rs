@@ -406,8 +406,8 @@ mod tests {
     fn merge_joins_overlapping_and_adjacent_spans_keeping_first_kind() {
         let spans = merge_spans(&[
             finding("a", 0, 5),
-            finding("b", 3, 8),
-            finding("c", 8, 12),
+            finding("b", 3, 8),  // überlappt a
+            finding("c", 8, 12), // grenzt an
             finding("d", 20, 25),
         ]);
 
