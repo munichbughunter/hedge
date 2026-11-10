@@ -2,13 +2,36 @@
 name = "hedge"
 version = "0.1.0"
 edition = "2024"
+description = "AI Guard Proxy: sees what your coding agent sends to the LLM API, masks or blocks secrets and PII, and records every request in a signed hash chain."
+license = "MIT"
+repository = "https://github.com/munichbughunter/hedge"
 
 [dependencies]
 axum = "0.8.9"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+colored = "3.1.1"
+ed25519-dalek = "3.0.0"
+getrandom = "0.4.3"
+hex = "0.4.3"
+libc = "0.2.191"
 regex = "1.13.1"
 reqwest = "0.13.5"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+getrandom = "0.4.3"
+reqwest = { version = "0.13.5", features = ["json"] }
+tower = "0.5.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

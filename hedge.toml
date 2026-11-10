@@ -1,8 +1,20 @@
-mode = "observe"
+# hedge.toml – AI Guard Proxy
+#
+# Hedge sitzt zwischen deinem Coding-Agent und der LLM-API. Der Agent zeigt
+# auf Hedge, Hedge prüft jeden Prompt und leitet ihn weiter:
+#
+#   export ANTHROPIC_BASE_URL=http://127.0.0.1:18765/anthropic
+#
+# Modus:  observe  = nur melden, nichts verändern (Standard, zum Einführen)
+#         redact   = Funde maskieren und weiterleiten
+#         block    = Anfrage ablehnen, sobald ein High-Fund dabei ist
+#                    (E-Mails & Co. werden dann maskiert, nicht blockiert)
+mode = "redact"
 
 [server]
-listen = "127.0.0.1:8080"
+listen = "127.0.0.1:18765"
 
+# Jeder Upstream ist unter /<name>/... erreichbar.
 [[upstreams]]
 name = "anthropic"
 url = "https://api.anthropic.com"
@@ -10,3 +22,34 @@ url = "https://api.anthropic.com"
 [[upstreams]]
 name = "openai"
 url = "https://api.openai.com"
+
+[timeouts]
+# connect_secs = 10
+# request_secs = 600
+
+[detectors]
+# secrets = true   # API-Keys, Tokens, Private Keys
+# pii = true       # E-Mail, IBAN
+
+# Severity pro Fundart überschreiben: low | medium | high
+# low    = nur melden/maskieren, nie blockieren
+# medium = maskieren (in redact und block)
+# high   = blockieren (in block)
+[severity]
+# email = "low"
+
+# Eigene Infrastruktur, die nie als Fund gilt.
+[allow]
+# values  = ["me@example.com"]
+# domains = ["example.com"]
+
+[log]
+# format = "pretty"   # pretty | json (json für zentrale Log-Systeme)
+# level  = "info"     # z. B. "hedge=debug"
+
+# Bezeugtes Protokoll: jede Anfrage als signierter Eintrag in einer Hash-Kette.
+# Prüfen mit: hedge verify
+[witness]
+# enabled = true
+# path = "~/.hedge/witness.jsonl"
+# key  = "~/.hedge/witness.key"
