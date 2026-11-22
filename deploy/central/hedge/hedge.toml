@@ -1,0 +1,47 @@
+# hedge.toml – zentraler Betrieb. Geschrieben von `hedge deploy compose`.
+#
+# Diese Datei wird im laufenden Betrieb neu geladen; jede Änderung steht im
+# Witness. Alle Optionen mit Erklärung zeigt `hedge init --dir <leerer
+# Ordner>` in der dort erzeugten hedge.toml.
+#
+# Zum Einführen bleibt alles beobachtend. Die drei Schalter zum Scharfstellen
+# stehen unten und sind mit [scharf] markiert.
+mode = "observe"                 # [scharf] redact = maskieren, block = ablehnen ab High
+
+[server]
+listen = "0.0.0.0:18765"
+require_client = {{REQUIRE_CLIENT}}           # nur Anfragen mit Client-Token annehmen
+
+[log]
+format = "json"
+
+[witness]
+path = "/var/lib/hedge/witness.jsonl"
+key  = "/var/lib/hedge/witness.key"
+
+[control]
+token = "/var/lib/hedge/control.token"
+
+# Traces und Metriken nach Grafana (Profil "observability" in .env).
+[telemetry]
+enabled = {{TELEMETRY}}
+endpoint = "http://lgtm:4318"
+
+# Presidio läuft im selben Compose-Projekt und ist nur für Hedge erreichbar.
+# Entwickler merken davon nichts.
+[presidio]
+enabled = true
+url = "http://presidio:3000"
+languages = ["de", "en"]
+enforce = false                  # [scharf] true: Namen maskieren/blockieren wie eingebaute Funde
+on_unavailable = "block"         # [scharf] wirkt mit enforce = true und mode ≠ observe:
+                                 # Was Presidio nicht prüfen konnte, geht nicht hinaus.
+
+# Tool-Aufrufe des Modells: erst melden, dann durchsetzen.
+[tools]
+# enforce = true
+# approve_in_chat = false        # Freigabe durch eine zweite Person (hedge approve <id>)
+
+# Clients: einer pro Entwickler. Anlegen auf dem Host mit
+#   hedge --config hedge/hedge.toml client add <name>
+{{CLIENTS}}

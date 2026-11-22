@@ -1,0 +1,25 @@
+# Observability-Stack für Hedge zum Ausprobieren: Grafana + Tempo (Traces) +
+# Prometheus (Metriken) + Loki in einem Container (grafana/otel-lgtm).
+#
+#   docker compose -f deploy/compose/docker-compose.yml up -d
+#   # in hedge.toml:  [telemetry] enabled = true
+#   open http://localhost:3000   → Dashboards → Hedge
+#
+# Presidio (Namen, Telefonnummern) gehört nicht mehr in diese Datei:
+#   hedge presidio enable          lokal, ein Befehl
+#   hedge deploy compose           zentral, Hedge + Presidio + dieser Stack
+services:
+  lgtm:
+    image: grafana/otel-lgtm:latest
+    ports:
+      - "3000:3000"   # Grafana
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP  ← hedge: telemetry.endpoint = "http://127.0.0.1:4318"
+    volumes:
+      - lgtm-data:/data
+      - ./grafana/hedge-dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/hedge-dashboards.yaml:ro
+      - ./grafana/dashboards:/otel-lgtm/hedge-dashboards:ro
+      - ./grafana/alerting/hedge-alerts.yaml:/otel-lgtm/grafana/conf/provisioning/alerting/hedge-alerts.yaml:ro
+
+volumes:
+  lgtm-data:

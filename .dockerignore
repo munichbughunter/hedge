@@ -1,0 +1,5 @@
+target
+.git
+Claude outputs
+*.md
+!README.md

@@ -1,0 +1,145 @@
+# hedge.toml – AI Guard Proxy
+#
+# Hedge sitzt zwischen deinem Coding-Agent und der LLM-API. Der Agent zeigt
+# auf Hedge, Hedge prüft jeden Prompt und jede Antwort und leitet weiter:
+#
+#   export ANTHROPIC_BASE_URL=http://127.0.0.1:18765/anthropic
+#
+# Diese Datei wird im laufenden Betrieb neu geladen (außer listen, witness,
+# telemetry, control – die brauchen einen Neustart). Jede Änderung wird im
+# Witness bezeugt.
+#
+# Modus:  observe  = nur melden, nichts verändern (Standard, zum Einführen)
+#         redact   = Funde maskieren und weiterleiten
+#         block    = Anfrage ablehnen, sobald ein High-Fund dabei ist
+#                    (E-Mails & Co. werden dann maskiert, nicht blockiert)
+mode = "observe"
+
+[server]
+listen = "127.0.0.1:18765"
+# require_client = false   # Central-Mode: nur Anfragen mit Client-Token annehmen
+
+# Jeder Upstream ist unter /<name>/... erreichbar. Andere Ziele gibt es nicht.
+[[upstreams]]
+name = "anthropic"
+url = "https://api.anthropic.com"
+
+[[upstreams]]
+name = "openai"
+url = "https://api.openai.com"
+
+[timeouts]
+# connect_secs = 10
+# request_secs = 600
+
+[detectors]
+# secrets = true   # API-Keys, Tokens, Private Keys
+# pii = true       # E-Mail, IBAN
+
+# Severity pro Fundart überschreiben: low | medium | high
+# low    = nur melden/maskieren, nie blockieren
+# medium = maskieren (in redact und block)
+# high   = blockieren (in block)
+[severity]
+# email = "low"
+
+# Eigene Infrastruktur, die nie als Fund gilt.
+[allow]
+# values  = ["me@example.com"]
+# domains = ["example.com"]
+
+# Modell-Antworten: Secrets/PII melden, Tool-Aufrufe und Tokens erfassen.
+[response]
+# inspect = true
+
+# Tool-Aufrufe des Modells (Bash, Write, …) prüfen, bevor der Agent sie sieht.
+#   enforce = false  → Treffer werden nur gemeldet (flag)
+#   enforce = true   → deny verwirft den Aufruf (das Modell erfährt warum),
+#                      hold fragt dich, bevor der Aufruf läuft
+[tools]
+# enforce = false
+# packs = ["destructive-shell", "credential-files", "exfiltration"]
+
+# Freigaben (hold). Standard: Hedge fragt direkt in der Agent-Session; du
+# antwortest dort mit `approve <id>` (oder `deny <id>`), dann läuft genau
+# dieser eine Aufruf. `hedge approve <id>` im Terminal geht immer.
+#   approve_in_chat = false → der Aufruf wartet stattdessen, bis jemand per
+#   `hedge approve <id>` entscheidet (für eine zweite Person / zentral).
+# approve_in_chat = true
+# approval_timeout_secs = 300   # so lange gilt die Anfrage
+
+# Bei jeder Freigabe-Anfrage Bescheid geben (lokal oder ins Team):
+# notify_command = "terminal-notifier -title Hedge -message \"$HEDGE_TOOL: $HEDGE_PREVIEW ($HEDGE_APPROVAL_ID)\""
+# notify_webhook = "https://hooks.slack.com/services/…"
+
+# Eigene Regeln stehen vor den Paketen; die erste passende gewinnt.
+# [[tools.rules]]
+# id = "no-prod-db"
+# tool = "Bash"                 # Glob, mehrere mit |
+# match = "psql .*prod"         # Regex auf die Eingabe
+# action = "hold"               # allow | deny | hold
+# reason = "Produktionsdatenbank nur mit Freigabe"
+
+# Erlaubte Modelle (Globs). Leer = alle.
+[models]
+# allow = ["claude-*"]
+# deny  = []
+
+# Token-Budgets (Input ohne Cache-Reads + Output). 0 = unbegrenzt.
+[budget]
+# daily_tokens   = 0     # pro Client und Tag
+# session_tokens = 0     # pro Agent-Session
+
+[log]
+# format = "pretty"   # pretty | json (json für zentrale Log-Systeme)
+# level  = "info"     # z. B. "hedge=debug"
+
+# Bezeugtes Protokoll: jede Anfrage als signierter Eintrag in einer Hash-Kette.
+# Prüfen mit: hedge verify
+[witness]
+# enabled = true
+# path = "~/.hedge/witness.jsonl"
+# key  = "~/.hedge/witness.key"
+# tool_preview = true   # kurze, maskierte Vorschau jedes Tool-Aufrufs
+# hints = true          # maskierter Hinweis pro Fund: p…@example.com, …a1b2
+
+# Steuer-API (hedge approve, hedge status). Das Token erzeugt `hedge init`.
+[control]
+# token = "~/.hedge/control.token"
+
+# OpenTelemetry (OTLP/HTTP): Traces und Metriken nach Grafana & Co.
+# Stack zum Ausprobieren: deploy/compose/docker-compose.yml
+[telemetry]
+# enabled = false
+# endpoint = "http://127.0.0.1:4318"
+# service_name = "hedge"
+
+# Presidio findet, was kein festes Format hat: Namen, Telefonnummern.
+# Einschalten mit einem Befehl:
+#
+#   hedge presidio enable
+#
+# Der Befehl holt das Image, startet den Container auf 127.0.0.1, prüft ihn
+# mit einem Testsatz und trägt enabled/managed hier ein. Danach startet
+# `hedge run` den Container mit. Ohne Presidio laufen die eingebauten
+# Detektoren unverändert weiter.
+[presidio]
+# enabled = false
+# managed = false                # true: Hedge startet den Container selbst (lokal)
+# url = "http://127.0.0.1:5002"  # zentral: der Dienst im internen Netz
+# languages = ["de", "en"]       # die erste gilt, wenn die Sprache unklar ist
+# entities = ["PERSON", "PHONE_NUMBER", "CREDIT_CARD", "IBAN_CODE"]
+# single_names = false           # true: auch einzelne Wörter als Namen melden
+#                                # ("Wagner"); in Code gibt das viele Fehlalarme
+# scope = ["user", "tool_result"]  # auch möglich: system, tools, assistant, tool_use
+# enforce = false                # false: Funde nur melden. true: maskieren oder
+#                                # blockieren wie eingebaute Funde (je nach mode)
+# on_unavailable = "allow"       # allow: weiterleiten und markieren
+#                                # block: nichts geht hinaus, was Presidio nicht
+#                                # prüfen konnte (wirkt, sobald enforce = true
+#                                # und mode nicht observe ist)
+
+# Central-Mode: bekannte Clients. Anlegen mit: hedge client add <name>
+# [[clients]]
+# name = "patrick"
+# token_sha256 = "…"

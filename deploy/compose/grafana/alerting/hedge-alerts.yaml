@@ -1,0 +1,174 @@
+# Alert-Regeln für Hedge (Grafana Unified Alerting, File-Provisioning).
+# Kontaktpunkte (Slack, E-Mail, …) legst du in Grafana unter
+# Alerting → Contact points an; ohne Kontaktpunkt erscheinen die Alerts
+# nur in der Oberfläche.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: hedge
+    folder: Hedge
+    interval: 1m
+    rules:
+      - uid: hedge-high-severity-finding
+        title: "Hedge: high-severity finding in a prompt"
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: critical
+        annotations:
+          summary: "A secret or other high-severity finding was sent towards an LLM API."
+          description: "Look at `hedge tail --alerts` or the Hedge dashboard for kind, client and session."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: sum(increase(hedge_findings_total{severity="high",direction="request"}[5m]))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              datasource: { type: __expr__, uid: __expr__ }
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+
+      - uid: hedge-tool-call-stopped
+        title: "Hedge: tool call denied, rejected or timed out"
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "The model requested a tool call that the policy stopped."
+          description: "`hedge tail --alerts -v` shows tool, rule and a masked preview."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: sum(increase(hedge_tool_calls_total{decision=~"deny|rejected|timeout"}[5m]))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              datasource: { type: __expr__, uid: __expr__ }
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+
+      - uid: hedge-witness-write-failed
+        title: "Hedge: witness write failed"
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: critical
+        annotations:
+          summary: "Hedge could not append to the witness chain. Requests are passing without a record."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: sum(increase(hedge_witness_errors_total[5m]))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              datasource: { type: __expr__, uid: __expr__ }
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+
+      - uid: hedge-presidio-not-ready
+        title: "Hedge: Presidio is not ready"
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: critical
+        annotations:
+          summary: "Presidio does not answer or lacks a configured language. Names and phone numbers are not being detected."
+          description: "With on_unavailable = block Hedge rejects requests until Presidio is back; with allow they pass unchecked. `hedge status` shows the reason, the witness has the events presidio_unavailable and presidio_ready."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: min(hedge_presidio_up)
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              datasource: { type: __expr__, uid: __expr__ }
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query
+
+      - uid: hedge-presidio-unchecked-requests
+        title: "Hedge: requests passed without the Presidio check"
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "Requests reached an LLM API without a complete check for names (Presidio away, failing or too slow)."
+          description: "Each of these requests carries the flag presidio_unavailable or presidio_timeout in the witness: `hedge tail --alerts`."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: sum(increase(hedge_presidio_unscanned_total{outcome="forwarded"}[5m]))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              datasource: { type: __expr__, uid: __expr__ }
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query

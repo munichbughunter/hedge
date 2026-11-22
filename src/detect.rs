@@ -43,6 +43,14 @@ pub fn describe_kind(kind: &str) -> &str {
         "jwt" => "JSON Web Token",
         "email" => "e-mail address",
         "iban_de" => "German IBAN",
+        "person_name" => "person name",
+        "phone_number" => "phone number",
+        "credit_card" => "credit card number",
+        "iban" => "IBAN",
+        "location" => "location",
+        "ip_address" => "IP address",
+        "us_ssn" => "US social security number",
+        "pii_other" => "personal data",
         other => other,
     }
 }

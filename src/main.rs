@@ -1,17 +1,3 @@
-mod config;
-mod detect;
-mod inspect;
-mod policy;
-mod proxy;
-
-use std::sync::Arc;
-
-use axum::{
-    Router,
-    routing::{any, get},
-};
-
-use proxy::AppState;
 use clap::Parser;
 
 #[tokio::main]

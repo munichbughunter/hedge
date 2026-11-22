@@ -1,0 +1,61 @@
+# Hedge zentral: Hedge und Presidio auf einem Host, dazu auf Wunsch Grafana.
+# Geschrieben von `hedge deploy compose` (Hedge {{VERSION}}).
+# Die Schritte stehen in README.md in diesem Verzeichnis.
+name: hedge
+
+services:
+  hedge:
+    image: ${HEDGE_IMAGE}
+    restart: unless-stopped
+    # Hedge startet erst, wenn Presidio die Sprachmodelle geladen hat.
+    depends_on:
+      presidio:
+        condition: service_healthy
+    ports:
+      # Standard: nur von diesem Host erreichbar. Davor gehört ein Reverse
+      # Proxy, der TLS terminiert (README, Abschnitt "TLS").
+      - "${HEDGE_BIND:-127.0.0.1}:${HEDGE_PORT:-18765}:18765"
+    volumes:
+      # Die Config liegt neben dieser Datei. Hedge liest Änderungen binnen
+      # Sekunden neu ein; der Container selbst kann sie nicht ändern.
+      - ./hedge:/etc/hedge:ro
+      # Witness, Signierschlüssel, Steuer-Token.
+      - hedge-data:/var/lib/hedge
+    networks: [default, guard]
+
+  presidio:
+    image: ${PRESIDIO_IMAGE}
+    build: ./presidio
+    restart: unless-stopped
+    environment:
+      WORKERS: ${PRESIDIO_WORKERS:-2}
+    # Kein Port nach außen und kein Weg ins Internet: Presidio bekommt
+    # Prompts im Klartext und hat keine eigene Anmeldung. Erreichbar ist es
+    # nur für Hedge, als http://presidio:3000.
+    networks: [guard]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # Grafana, Tempo, Prometheus und Loki in einem Container, mit dem
+  # Hedge-Dashboard und den Alerts. Einschalten:
+  #   COMPOSE_PROFILES=observability in .env  und  [telemetry] enabled = true
+  lgtm:
+    profiles: [observability]
+    image: grafana/otel-lgtm:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - lgtm-data:/data
+      - ./grafana/hedge-dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/hedge-dashboards.yaml:ro
+      - ./grafana/dashboards:/otel-lgtm/hedge-dashboards:ro
+      - ./grafana/alerting/hedge-alerts.yaml:/otel-lgtm/grafana/conf/provisioning/alerting/hedge-alerts.yaml:ro
+
+networks:
+  # Nur Hedge und Presidio, ohne Verbindung nach außen.
+  guard:
+    internal: true
+
+volumes:
+  hedge-data:
+  lgtm-data:

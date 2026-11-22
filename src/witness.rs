@@ -6,12 +6,16 @@
 //! gelöschter oder eingeschobener Eintrag fällt auf.
 //!
 //! Was NICHT im Protokoll steht: Prompt-Text, Antworten, Auth-Header. Nur
-//! Hashes der Bodies, Fundarten mit Pfad, Entscheidung und Metadaten.
+//! Hashes der Bodies, Fundarten mit Pfad, Entscheidung, Tokens und – wenn
+//! eingeschaltet – eine kurze, maskierte Vorschau jedes Tool-Aufrufs.
 //! Das Protokoll darf deshalb zentral gesammelt werden, ohne selbst zum
 //! Datenleck zu werden.
+//!
+//! Formatstabilität: Neue Felder werden nur serialisiert, wenn sie gesetzt
+//! sind. Einträge aus älteren Versionen behalten so ihren Hash.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -20,8 +24,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::Mode;
-use crate::inspect::{Action, Located};
+use crate::inspect::Located;
 
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -30,6 +33,30 @@ pub struct FindingRecord {
     pub kind: String,
     pub severity: String,
     pub path: String,
+    /// Maskierter Hinweis auf den Wert (`p…@example.com`, `…a1b2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// Derselbe Fund kam in dieser Session schon vor – Agents schicken die
+    /// ganze Unterhaltung mit jeder Anfrage erneut.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub repeat: bool,
+    /// Nur gemeldet: Der Fund hat an der Anfrage nichts geändert, auch wenn
+    /// der Modus maskiert oder blockiert (Presidio ohne `enforce`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub advisory: bool,
+}
+
+impl FindingRecord {
+    pub fn new(kind: &str, severity: &str, path: &str) -> Self {
+        Self {
+            kind: kind.to_owned(),
+            severity: severity.to_owned(),
+            path: path.to_owned(),
+            hint: None,
+            repeat: false,
+            advisory: false,
+        }
+    }
 }
 
 impl From<&Located> for FindingRecord {
@@ -38,8 +65,35 @@ impl From<&Located> for FindingRecord {
             kind: l.finding.kind.to_owned(),
             severity: l.finding.severity.as_str().to_owned(),
             path: l.path.clone(),
+            hint: l.hint.clone(),
+            repeat: false,
+            advisory: l.advisory,
         }
     }
+}
+
+/// Ein Tool-Aufruf, den das Modell angefordert hat.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolRecord {
+    pub id: String,
+    pub name: String,
+    /// SHA-256 der Eingabe (kompaktes JSON).
+    pub input_sha256: String,
+    /// Kurze, maskierte Vorschau (erster String-Wert der Eingabe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// Regel, die gegriffen hat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// allow | flag | deny | held | approved | rejected | timeout
+    pub decision: String,
+    /// ID der Freigabe-Anfrage, falls der Aufruf eine gebraucht hat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Ein Eintrag der Kette. Feldreihenfolge ist Teil des Formats: Hash und
@@ -66,6 +120,43 @@ pub struct Entry {
     /// HTTP-Status der Upstream-Antwort; None, wenn blockiert.
     pub status: Option<u16>,
     pub duration_ms: u64,
+    /// Agent-Session (Kurzform), falls der Agent eine mitschickt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Client im Central-Mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// Input-Tokens ohne Cache-Reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    /// Aus dem Prompt-Cache gelesene Tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_cached: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Tool-Aufrufe aus der Antwort, mit Entscheidung.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolRecord>,
+    /// Funde in der Modell-Antwort (nur beobachtet).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_findings: Vec<FindingRecord>,
+    /// Auffälligkeiten, z. B. `unwitnessed_tool_result`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
+    /// Antwort wurde gestreamt.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream: bool,
+    /// Strom endete vorzeitig (Client weg oder Upstream-Fehler).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub aborted: bool,
+    /// Ereignis statt Anfrage, z. B. `config_reload`, `start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    /// Begründung oder Detail (Block-Grund, Config-Hash, Fehler).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     /// Erste 16 Hex-Zeichen des öffentlichen Schlüssels.
     pub key_id: String,
     /// Hash des Vorgängers (GENESIS beim ersten Eintrag).
@@ -98,20 +189,64 @@ impl Entry {
     }
 }
 
-/// Was der Proxy pro Anfrage weiß, bevor der Witness Kette und Signatur ergänzt.
-pub struct Draft<'a> {
-    pub upstream: &'a str,
-    pub method: &'a str,
-    pub path: &'a str,
-    pub model: Option<&'a str>,
-    pub mode: Mode,
-    pub action: Action,
-    pub findings: &'a [Located],
-    pub body_in: &'a [u8],
+/// Die Fakten zu einem Eintrag. Kette und Signatur ergänzt der Witness.
+#[derive(Debug, Clone, Default)]
+pub struct Record {
+    pub upstream: String,
+    pub method: String,
+    pub path: String,
+    pub model: Option<String>,
+    pub mode: String,
+    pub action: String,
+    pub findings: Vec<FindingRecord>,
+    pub body_sha256_in: String,
     /// Nur gesetzt, wenn sich der Body durch Maskierung geändert hat.
-    pub body_out: Option<&'a [u8]>,
+    pub body_sha256_out: Option<String>,
     pub status: Option<u16>,
     pub duration_ms: u64,
+    pub session: Option<String>,
+    pub client: Option<String>,
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
+    pub tokens_cached: Option<u64>,
+    pub stop_reason: Option<String>,
+    pub tools: Vec<ToolRecord>,
+    pub response_findings: Vec<FindingRecord>,
+    pub flags: Vec<String>,
+    pub stream: bool,
+    pub aborted: bool,
+    pub event: Option<String>,
+    pub detail: Option<String>,
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Ein Punkt der Kette, der außerhalb aufbewahrt werden kann. Wer einen
+/// Anker hat, erkennt auch das Abschneiden oder Neuschreiben des Endes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Anchor {
+    pub seq: u64,
+    pub hash: String,
+}
+
+impl Anchor {
+    /// Liest `seq:hash`.
+    pub fn parse(text: &str) -> Option<Anchor> {
+        let (seq, hash) = text.trim().split_once(':')?;
+        let seq = seq.parse().ok()?;
+        (hash.len() == 64 && hex::decode(hash).is_ok()).then(|| Anchor {
+            seq,
+            hash: hash.to_owned(),
+        })
+    }
+}
+
+impl std::fmt::Display for Anchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.seq, self.hash)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -200,25 +335,47 @@ impl Witness {
         &self.key_id
     }
 
+    /// Der letzte Eintrag als Anker, falls es schon einen gibt.
+    pub fn head(&self) -> Option<Anchor> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (inner.next_seq > 1).then(|| Anchor {
+            seq: inner.next_seq - 1,
+            hash: inner.prev.clone(),
+        })
+    }
+
     /// Hängt einen Eintrag an. Hash-Kette und Signatur werden hier gebildet;
     /// der Aufrufer liefert nur Fakten.
-    pub fn record(&self, draft: Draft<'_>) -> Result<Entry, WitnessError> {
+    pub fn record(&self, r: Record) -> Result<Entry, WitnessError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut entry = Entry {
             seq: inner.next_seq,
             ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            upstream: draft.upstream.to_owned(),
-            method: draft.method.to_owned(),
-            path: draft.path.to_owned(),
-            model: draft.model.map(str::to_owned),
-            mode: draft.mode.as_str().to_owned(),
-            action: draft.action.as_str().to_owned(),
-            findings: draft.findings.iter().map(FindingRecord::from).collect(),
-            body_sha256_in: hex::encode(Sha256::digest(draft.body_in)),
-            body_sha256_out: draft.body_out.map(|b| hex::encode(Sha256::digest(b))),
-            status: draft.status,
-            duration_ms: draft.duration_ms,
+            upstream: r.upstream,
+            method: r.method,
+            path: r.path,
+            model: r.model,
+            mode: r.mode,
+            action: r.action,
+            findings: r.findings,
+            body_sha256_in: r.body_sha256_in,
+            body_sha256_out: r.body_sha256_out,
+            status: r.status,
+            duration_ms: r.duration_ms,
+            session: r.session,
+            client: r.client,
+            tokens_in: r.tokens_in,
+            tokens_out: r.tokens_out,
+            tokens_cached: r.tokens_cached,
+            stop_reason: r.stop_reason,
+            tools: r.tools,
+            response_findings: r.response_findings,
+            flags: r.flags,
+            stream: r.stream,
+            aborted: r.aborted,
+            event: r.event,
+            detail: r.detail,
             key_id: self.key_id.clone(),
             prev: inner.prev.clone(),
             hash: String::new(),
@@ -258,6 +415,30 @@ pub fn read_entries(path: &Path) -> Result<Vec<Entry>, WitnessError> {
     Ok(entries)
 }
 
+/// Liest die Einträge ab einem Byte-Offset (für `tail -f`). Liefert die
+/// neuen Einträge und den Offset hinter der letzten vollständigen Zeile.
+pub fn read_entries_from(path: &Path, offset: u64) -> Result<(Vec<Entry>, u64), WitnessError> {
+    let mut file = File::open(path).map_err(io_err(path))?;
+    let len = file.metadata().map_err(io_err(path))?.len();
+    // Datei wurde ersetzt oder gekürzt: von vorn beginnen.
+    let offset = if offset > len { 0 } else { offset };
+    file.seek(SeekFrom::Start(offset)).map_err(io_err(path))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).map_err(io_err(path))?;
+
+    let complete = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let mut entries = Vec::new();
+    for line in buf[..complete].split(|b| *b == b'\n') {
+        if line.iter().all(|b| b.is_ascii_whitespace()) {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_slice::<Entry>(line) {
+            entries.push(entry);
+        }
+    }
+    Ok((entries, offset + complete as u64))
+}
+
 /// Ergebnis einer Verifikation.
 #[derive(Debug)]
 pub struct VerifyReport {
@@ -265,6 +446,10 @@ pub struct VerifyReport {
     pub first_ts: Option<String>,
     pub last_ts: Option<String>,
     pub key_id: Option<String>,
+    /// Gesetzt, wenn die geprüften Einträge nicht bei 1 beginnen (Auszug).
+    pub partial_from: Option<u64>,
+    /// Letzter Eintrag der geprüften Kette.
+    pub head: Option<Anchor>,
     /// Leer = Kette intakt.
     pub problems: Vec<Problem>,
 }
@@ -284,8 +469,14 @@ impl VerifyReport {
 /// Prüft Hash-Kette, Sequenz und Signaturen gegen den öffentlichen Schlüssel.
 pub fn verify(entries: &[Entry], verifying: &VerifyingKey) -> VerifyReport {
     let mut problems = Vec::new();
-    let mut prev_hash = GENESIS.to_owned();
     let mut expected_seq = entries.first().map(|e| e.seq).unwrap_or(1);
+    // Ein Auszug beginnt mitten in der Kette: Sein erster `prev` zeigt auf
+    // einen Eintrag, der nicht vorliegt, und kann nicht geprüft werden.
+    let partial_from = (expected_seq != 1).then_some(expected_seq);
+    let mut prev_hash = match (partial_from, entries.first()) {
+        (Some(_), Some(first)) => first.prev.clone(),
+        _ => GENESIS.to_owned(),
+    };
     let key_id = key_id_of(verifying);
 
     for entry in entries {
@@ -343,7 +534,75 @@ pub fn verify(entries: &[Entry], verifying: &VerifyingKey) -> VerifyReport {
         first_ts: entries.first().map(|e| e.ts.clone()),
         last_ts: entries.last().map(|e| e.ts.clone()),
         key_id: Some(key_id),
+        partial_from,
+        head: entries.last().map(|e| Anchor {
+            seq: e.seq,
+            hash: e.hash.clone(),
+        }),
         problems,
+    }
+}
+
+/// Prüft, ob die Kette den Anker enthält. Fehlt er, wurde das Ende
+/// abgeschnitten oder die Kette ab dort neu geschrieben.
+pub fn check_anchor(entries: &[Entry], anchor: &Anchor) -> Result<(), Problem> {
+    match entries.iter().find(|e| e.seq == anchor.seq) {
+        Some(e) if e.hash == anchor.hash => Ok(()),
+        Some(_) => Err(Problem {
+            seq: anchor.seq,
+            reason: "anchor mismatch: entry has a different hash (chain was rewritten)".into(),
+        }),
+        None => Err(Problem {
+            seq: anchor.seq,
+            reason: "anchor missing: entry is not in the chain (chain was truncated)".into(),
+        }),
+    }
+}
+
+/// Ein Auszug der Kette zum Weitergeben: Einträge plus öffentlicher
+/// Schlüssel. Prüfbar mit `hedge verify --bundle`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bundle {
+    pub format: String,
+    pub exported_at: String,
+    pub public_key: String,
+    pub key_id: String,
+    /// Kopf der gesamten Kette zum Zeitpunkt des Exports.
+    pub head: Option<Anchor>,
+    pub entries: Vec<Entry>,
+}
+
+pub const BUNDLE_FORMAT: &str = "hedge-bundle/1";
+
+impl Bundle {
+    pub fn new(entries: Vec<Entry>, verifying: &VerifyingKey, head: Option<Anchor>) -> Self {
+        Self {
+            format: BUNDLE_FORMAT.into(),
+            exported_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            public_key: hex::encode(verifying.to_bytes()),
+            key_id: key_id_of(verifying),
+            head,
+            entries,
+        }
+    }
+
+    pub fn verifying_key(&self) -> Result<VerifyingKey, String> {
+        let bytes =
+            hex::decode(&self.public_key).map_err(|e| format!("public_key not hex: {e}"))?;
+        let bytes = <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| "public_key must be 32 bytes".to_owned())?;
+        VerifyingKey::from_bytes(&bytes).map_err(|e| e.to_string())
+    }
+}
+
+/// Der zusammenhängende Abschnitt der Kette, der alle Einträge einer
+/// Session enthält (inklusive fremder Einträge dazwischen, damit die
+/// Verkettung prüfbar bleibt).
+pub fn session_range<'a>(entries: &'a [Entry], session: &str) -> &'a [Entry] {
+    let is = |e: &Entry| e.session.as_deref().is_some_and(|s| s.starts_with(session));
+    match (entries.iter().position(is), entries.iter().rposition(is)) {
+        (Some(a), Some(b)) => &entries[a..=b],
+        _ => &[],
     }
 }
 
@@ -381,8 +640,9 @@ pub fn generate_keypair(key_path: &Path) -> Result<VerifyingKey, WitnessError> {
     Ok(signing.verifying_key())
 }
 
+/// Schreibt eine geheime Datei (0600), ohne eine vorhandene zu überschreiben.
 #[cfg(unix)]
-fn write_private(path: &Path, content: &[u8]) -> Result<(), WitnessError> {
+pub fn write_private(path: &Path, content: &[u8]) -> Result<(), WitnessError> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = OpenOptions::new()
         .write(true)
@@ -394,7 +654,7 @@ fn write_private(path: &Path, content: &[u8]) -> Result<(), WitnessError> {
 }
 
 #[cfg(not(unix))]
-fn write_private(path: &Path, content: &[u8]) -> Result<(), WitnessError> {
+pub fn write_private(path: &Path, content: &[u8]) -> Result<(), WitnessError> {
     fs::write(path, content).map_err(io_err(path))
 }
 
@@ -448,6 +708,7 @@ fn decode_key(path: &Path, hex_text: &str) -> Result<[u8; 32], WitnessError> {
 mod tests {
     use super::*;
     use crate::detect::{Finding, Severity};
+    use crate::inspect::Located;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hedge-witness-{name}-{}", std::process::id()));
@@ -456,19 +717,20 @@ mod tests {
         dir
     }
 
-    fn draft<'a>(upstream: &'a str, findings: &'a [Located]) -> Draft<'a> {
-        Draft {
-            upstream,
-            method: "POST",
-            path: "/v1/messages",
-            model: Some("claude-x"),
-            mode: Mode::Redact,
-            action: Action::Redact,
-            findings,
-            body_in: b"{\"a\":1}",
-            body_out: Some(b"{\"a\":2}"),
+    fn draft(upstream: &str, findings: &[Located]) -> Record {
+        Record {
+            upstream: upstream.into(),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            model: Some("claude-x".into()),
+            mode: "redact".into(),
+            action: "redact".into(),
+            findings: findings.iter().map(FindingRecord::from).collect(),
+            body_sha256_in: sha256_hex(b"{\"a\":1}"),
+            body_sha256_out: Some(sha256_hex(b"{\"a\":2}")),
             status: Some(200),
             duration_ms: 42,
+            ..Record::default()
         }
     }
 
@@ -482,6 +744,9 @@ mod tests {
                 start: 0,
                 end: 1,
             },
+            hint: Some("…wxyz".into()),
+            fingerprint: 7,
+            advisory: false,
         }]
     }
 
@@ -593,12 +858,188 @@ mod tests {
         let w = Witness::open(&log, &key).unwrap();
         let secret_body = b"{\"content\":\"sk-ant-supersecret\"}";
         let mut d = draft("anthropic", &[]);
-        d.body_in = secret_body;
-        d.body_out = None;
+        d.body_sha256_in = sha256_hex(secret_body);
+        d.body_sha256_out = None;
         w.record(d).unwrap();
 
         let raw = fs::read_to_string(&log).unwrap();
         assert!(!raw.contains("supersecret"));
         assert!(raw.contains(&hex::encode(Sha256::digest(secret_body))));
+    }
+
+    /// Ein Eintrag im Format von v0.1 (ohne die neuen Felder) muss mit der
+    /// aktuellen Version denselben Hash ergeben, sonst bräche jedes Update
+    /// die bestehende Kette.
+    #[test]
+    fn entries_without_new_fields_keep_their_hash() {
+        let dir = temp_dir("compat");
+        let key = dir.join("witness.key");
+        let log = dir.join("witness.jsonl");
+        let vk = generate_keypair(&key).unwrap();
+        let w = Witness::open(&log, &key).unwrap();
+        let e = w.record(draft("anthropic", &[])).unwrap();
+
+        let line = fs::read_to_string(&log).unwrap();
+        for field in [
+            "session",
+            "tokens_in",
+            "tools",
+            "flags",
+            "stream",
+            "event",
+            "detail",
+        ] {
+            assert!(
+                !line.contains(&format!("\"{field}\"")),
+                "{field} must be omitted when unset"
+            );
+        }
+        let v01_keys = [
+            "seq",
+            "ts",
+            "upstream",
+            "method",
+            "path",
+            "model",
+            "mode",
+            "action",
+            "findings",
+            "body_sha256_in",
+            "body_sha256_out",
+            "status",
+            "duration_ms",
+            "key_id",
+            "prev",
+            "hash",
+            "sig",
+        ];
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let keys: Vec<&str> = parsed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys, v01_keys,
+            "field set and order of a plain entry are part of the format"
+        );
+
+        let reread = read_entries(&log).unwrap();
+        assert_eq!(reread[0], e);
+        assert!(verify(&reread, &vk).is_ok());
+    }
+
+    #[test]
+    fn new_fields_are_covered_by_the_hash() {
+        let dir = temp_dir("v2");
+        let key = dir.join("witness.key");
+        let log = dir.join("witness.jsonl");
+        let vk = generate_keypair(&key).unwrap();
+        let w = Witness::open(&log, &key).unwrap();
+        let mut r = draft("anthropic", &[]);
+        r.session = Some("abcd1234".into());
+        r.tokens_in = Some(10);
+        r.tokens_out = Some(5);
+        r.stream = true;
+        r.tools = vec![ToolRecord {
+            id: "toolu_1".into(),
+            name: "Bash".into(),
+            input_sha256: sha256_hex(b"{}"),
+            preview: Some("git status".into()),
+            rule: Some("HEDGE-SHELL-003".into()),
+            decision: "deny".into(),
+            approval: None,
+        }];
+        w.record(r).unwrap();
+
+        let mut entries = read_entries(&log).unwrap();
+        assert!(verify(&entries, &vk).is_ok());
+        entries[0].tools[0].decision = "allow".into();
+        assert!(
+            !verify(&entries, &vk).is_ok(),
+            "tool decisions are tamper-evident"
+        );
+    }
+
+    #[test]
+    fn partial_chains_verify_and_anchors_detect_truncation() {
+        let dir = temp_dir("anchor");
+        let key = dir.join("witness.key");
+        let log = dir.join("witness.jsonl");
+        let vk = generate_keypair(&key).unwrap();
+        let w = Witness::open(&log, &key).unwrap();
+        assert!(w.head().is_none());
+        for i in 0..5 {
+            let mut r = draft("anthropic", &[]);
+            r.session = Some(if i == 1 || i == 3 { "sess-a" } else { "sess-b" }.into());
+            w.record(r).unwrap();
+        }
+        let entries = read_entries(&log).unwrap();
+        let head = w.head().unwrap();
+        assert_eq!(head.seq, 5);
+        assert_eq!(Anchor::parse(&head.to_string()), Some(head.clone()));
+        assert!(Anchor::parse("5:zz").is_none());
+
+        // Auszug einer Session: zusammenhängender Abschnitt, prüfbar.
+        let range = session_range(&entries, "sess-a");
+        assert_eq!(
+            range.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        let report = verify(range, &vk);
+        assert!(report.is_ok(), "{:?}", report.problems);
+        assert_eq!(report.partial_from, Some(2));
+        assert!(session_range(&entries, "nope").is_empty());
+
+        // Abschneiden des Endes besteht `verify`, aber nicht den Anker.
+        let truncated = &entries[..3];
+        assert!(verify(truncated, &vk).is_ok());
+        assert!(
+            check_anchor(truncated, &head)
+                .unwrap_err()
+                .reason
+                .contains("truncated")
+        );
+        assert!(check_anchor(&entries, &head).is_ok());
+        let wrong = Anchor {
+            seq: 2,
+            hash: head.hash.clone(),
+        };
+        assert!(
+            check_anchor(&entries, &wrong)
+                .unwrap_err()
+                .reason
+                .contains("rewritten")
+        );
+
+        // Bundle: Schlüssel reist mit.
+        let bundle = Bundle::new(range.to_vec(), &vk, Some(head));
+        let json = serde_json::to_string(&bundle).unwrap();
+        let back: Bundle = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.format, BUNDLE_FORMAT);
+        assert!(verify(&back.entries, &back.verifying_key().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn incremental_read_follows_appends() {
+        let dir = temp_dir("follow");
+        let key = dir.join("witness.key");
+        let log = dir.join("witness.jsonl");
+        generate_keypair(&key).unwrap();
+        let w = Witness::open(&log, &key).unwrap();
+        w.record(draft("a", &[])).unwrap();
+        let (first, off) = read_entries_from(&log, 0).unwrap();
+        assert_eq!(first.len(), 1);
+        let (none, off2) = read_entries_from(&log, off).unwrap();
+        assert!(none.is_empty());
+        assert_eq!(off, off2);
+        w.record(draft("b", &[])).unwrap();
+        w.record(draft("c", &[])).unwrap();
+        let (more, _) = read_entries_from(&log, off).unwrap();
+        assert_eq!(
+            more.iter().map(|e| e.upstream.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
     }
 }
