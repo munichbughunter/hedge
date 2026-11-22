@@ -1,0 +1,181 @@
+# Hedge – values for a central gateway on Kubernetes.
+#
+# Hedge is a single-instance service: budgets and pending approvals live in
+# the process, and the witness chain has exactly one writer. The chart
+# therefore always runs one replica and replaces it (strategy Recreate)
+# instead of rolling. There is no replica count to set.
+
+image:
+  # The image you built from the Dockerfile and pushed to your registry.
+  repository: ""
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# hedge.toml, mounted read-only at /etc/hedge/hedge.toml. Hedge reloads it
+# when the ConfigMap changes (about a minute after `helm upgrade`, as soon
+# as the kubelet has synced it); only listen addresses, [witness],
+# [telemetry], [control] and [log] need a pod restart.
+#
+# Clients and admins: run `hedge client add <name> --print` (or
+# `hedge admin add <name> --print`) anywhere, e.g. in the pod, and paste the
+# block here. Only hashes are stored, so this file may live in Git.
+config: |
+  mode = "observe"
+
+  [server]
+  listen = "0.0.0.0:18765"
+  # require_client = true      # as soon as the first [[clients]] block exists
+
+  [control]
+  token = "/var/lib/hedge/control.token"
+  listen = "0.0.0.0:18766"
+
+  [witness]
+  path = "/var/lib/hedge/witness.jsonl"
+  key = "/var/lib/hedge/witness.key"
+  rotate_mb = 64
+
+  [log]
+  format = "json"
+
+  [telemetry]
+  # enabled = true
+  # endpoint = "http://otel-collector.observability:4318"
+
+# Witness, signing key and control token. Without a volume the chain and its
+# key are gone with the pod – keep this on.
+persistence:
+  enabled: true
+  # Use a claim you created yourself instead of letting the chart create one.
+  existingClaim: ""
+  size: 5Gi
+  storageClass: ""
+  accessMode: ReadWriteOnce
+
+# The signing key and the control token are created on the volume at first
+# start. To manage them yourself, put them into a Secret with the keys
+# `witness.key`, `witness.key.pub` and `control.token`; it is mounted at
+# /etc/hedge-secrets, and `config` above must point there:
+#   [witness] key = "/etc/hedge-secrets/witness.key"
+#   [control] token = "/etc/hedge-secrets/control.token"
+secrets:
+  existingSecret: ""
+
+readiness:
+  # false: the pod is ready while the process answers. If the witness cannot
+  #        be written, traffic keeps flowing unrecorded and the alert
+  #        "witness write failed" fires – Hedge's default behaviour.
+  # true:  the pod is ready only while /ready says so: the witness can be
+  #        written and – if Presidio findings are enforced with
+  #        on_unavailable = "block" – Presidio answers. A full volume then
+  #        takes Hedge out of the Service: no record, no traffic.
+  requireWitness: false
+
+# A little longer than server.shutdown_grace_secs (30), so Hedge can finish
+# running answers and write its `stop` entry before the kubelet kills it.
+terminationGracePeriodSeconds: 45
+
+# Starting values, not measurements: watch the pod and adjust. Memory grows
+# with the size of the active witness segment (rotate_mb) and the number of
+# parallel requests.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# The proxy: what agents talk to.
+service:
+  type: ClusterIP
+  port: 18765
+  annotations: {}
+
+# The control API (status, approvals, witness) on its own Service, so it can
+# be exposed and restricted separately. Reach it with
+#   kubectl port-forward svc/<release>-hedge-control 18766
+# or through controlIngress below.
+control:
+  service:
+    type: ClusterIP
+    port: 18766
+    annotations: {}
+
+# Ingress for agents. The annotations are for ingress-nginx and carry what a
+# reverse proxy in front of Hedge has to do (docs/operations.md): no
+# buffering, long quiet connections, large request bodies.
+ingress:
+  enabled: false
+  className: ""
+  host: hedge.example.com
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "660"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "660"
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+  tls:
+    enabled: true
+    secretName: hedge-tls
+
+# Ingress for admins, on its own host name. Restrict it to the admin network.
+controlIngress:
+  enabled: false
+  className: ""
+  host: hedge-admin.example.com
+  annotations:
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.10.0/24"
+  tls:
+    enabled: true
+    secretName: hedge-admin-tls
+
+# Limits who may connect to the pod. Egress stays open: Hedge has to reach
+# the LLM APIs.
+networkPolicy:
+  enabled: false
+  # Who may reach the proxy port. Empty: every pod in the cluster.
+  proxyFrom: []
+  # - namespaceSelector:
+  #     matchLabels:
+  #       kubernetes.io/metadata.name: ingress-nginx
+  # Who may reach the control port. Empty: nobody but port-forward.
+  controlFrom: []
+
+# Extra environment, e.g. a corporate forward proxy:
+env: []
+# - name: HTTPS_PROXY
+#   value: http://proxy.example.com:3128
+# - name: NO_PROXY
+#   value: .svc,.cluster.local,localhost,127.0.0.1
+
+# Extra volumes, e.g. a CA bundle for a proxy that inspects TLS. The bundle
+# must hold the public CAs and yours: SSL_CERT_FILE replaces the image's
+# store, it does not add to it.
+#   extraVolumes:
+#     - name: ca-bundle
+#       configMap: { name: ca-bundle }
+#   extraVolumeMounts:
+#     - name: ca-bundle
+#       mountPath: /etc/hedge-ca
+#       readOnly: true
+#   env:
+#     - name: SSL_CERT_FILE
+#       value: /etc/hedge-ca/ca-bundle.pem
+extraVolumes: []
+extraVolumeMounts: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

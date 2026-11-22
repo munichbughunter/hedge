@@ -8,7 +8,7 @@
 //! Farbe übersetzt.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::NaiveDate;
 use ed25519_dalek::VerifyingKey;
@@ -229,42 +229,37 @@ fn local_day(ts: &str) -> Option<NaiveDate> {
     parse_ts(ts).map(|t| t.with_timezone(&chrono::Local).date_naive())
 }
 
-/// Liest den Witness fortlaufend. Wird die Datei ersetzt oder gekürzt,
-/// beginnt das Modell von vorn.
+/// So viele Einträge holt die Ansicht beim Start mindestens aus abgelegten
+/// Segmenten dazu – genug für die letzten Tage, ohne alles zu laden.
+const HISTORY: usize = 20_000;
+
+/// Liest den Witness fortlaufend, auch über eine Rotation hinweg. Wird die
+/// Datei geleert oder beginnt eine andere Kette, beginnt das Modell von vorn.
 pub struct Source {
-    path: PathBuf,
-    offset: u64,
+    follower: witness::Follower,
     key: Option<VerifyingKey>,
 }
 
 impl Source {
     pub fn new(path: &Path, key: Option<VerifyingKey>) -> Self {
         Self {
-            path: path.to_path_buf(),
-            offset: 0,
+            follower: witness::Follower::new(path).with_history(HISTORY),
             key,
         }
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.follower.path()
     }
 
     pub fn fresh_model(&self) -> Model {
         Model::new(self.key)
     }
 
-    /// Liefert die neuen Einträge; `true` an erster Stelle heißt: die Datei
+    /// Liefert die neuen Einträge; `true` an erster Stelle heißt: die Kette
     /// hat neu begonnen, das Modell muss verworfen werden.
     pub fn poll(&mut self) -> (bool, Vec<Entry>) {
-        match witness::read_entries_from(&self.path, self.offset) {
-            Ok((entries, next)) => {
-                let restarted = next < self.offset;
-                self.offset = next;
-                (restarted, entries)
-            }
-            Err(_) => (false, Vec::new()),
-        }
+        self.follower.poll()
     }
 }
 
@@ -967,6 +962,8 @@ fn event_row(e: &Entry, event: &str) -> TapeRow {
         ("config_reload_failed", _) => ("CONFIG", Tone::Bad, "REJECTED", Tone::Bad),
         ("presidio_unavailable", _) => ("OUTAGE", Tone::Bad, "PRESIDIO DOWN", Tone::Bad),
         ("presidio_ready", _) => ("READY", Tone::Ok, "PRESIDIO", Tone::Ok),
+        ("rotate", _) => ("ROTATE", Tone::Muted, "", Tone::Muted),
+        ("recovered", _) => ("WITNESS", Tone::Warn, "RECOVERED", Tone::Warn),
         _ => ("EVENT", Tone::Dim, "", Tone::Dim),
     };
     TapeRow {

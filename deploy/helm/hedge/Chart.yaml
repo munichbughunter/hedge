@@ -1,0 +1,14 @@
+apiVersion: v2
+name: hedge
+description: Hedge – AI Guard Proxy as a central gateway. One instance, one witness chain.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/munichbughunter/hedge
+sources:
+  - https://github.com/munichbughunter/hedge
+keywords:
+  - llm
+  - proxy
+  - security
+  - audit

@@ -356,7 +356,12 @@ hedge head                                # current head as  <seq>:<hash>  – k
 hedge verify --anchor <seq>:<hash>        # also detects a chain whose end was cut off
 hedge export --session 3f2a9c1e -o run.json   # evidence for one agent session
 hedge verify --bundle run.json            # anyone can check it, offline
+hedge rotate                              # close the active segment; the chain runs on
 ```
+
+With `[witness] rotate_mb` set, Hedge closes a segment at that size by
+itself. Closed segments (`witness.<first>-<last>.jsonl`) never change again
+and can be archived; `hedge verify` checks all of them as one chain.
 
 A changed byte, a deleted line or an inserted entry fails verification and
 names the entry. The witness contains no prompt text and no credentials, so
@@ -371,41 +376,68 @@ witness entry – your tracing backend becomes an external anchor for free.
 
 ## For admins
 
+Hedge runs on a developer's laptop or as one central gateway for a team. The
+runbook for the central case is [docs/operations.md](docs/operations.md);
+ready-made setups are in [deploy/](deploy/README.md): a Compose directory
+written by `hedge deploy compose`, a systemd unit, a Helm chart.
+
 **The whole setup in one directory.** `hedge deploy compose` writes a Compose
 project from the binary: Hedge, Presidio on an internal network that nothing
-else can reach, optionally Grafana with dashboard and alerts, a central
-`hedge.toml` and a README with the steps.
+else can reach, optionally Caddy for TLS and Grafana with dashboard and
+alerts, a central `hedge.toml` and a README with the steps.
 
 ```bash
-hedge deploy compose --client alice --observability   # → ./hedge-central, prints alice's token once
+hedge deploy compose --client alice --tls --observability   # → ./hedge-central, prints alice's token once
 cd hedge-central && docker compose up -d
-curl -s 127.0.0.1:18765/ready                          # {"ready":true} once presidio is up
+curl -s 127.0.0.1:18765/ready                                # {"ready":true} once presidio is up
 ```
 
 Developers get a URL and a token. They never see Presidio; `hedge status
 --url … --token …` tells them whether it is active. The generated config
 starts in observe mode with `on_unavailable = "block"` prepared, so that
-switching `enforce` on later also makes an outage fail closed. `GET /ready`
-(no token) is 200 only while Hedge serves requests the way the config
-demands; `hedge ready` is the same check as a command, for container
-health checks. `/health` only says the process is alive.
+switching `enforce` on later also makes an outage fail closed.
 
-**Central gateway by hand.** Listen on a network address, require client tokens:
+**Central gateway by hand.** Listen on a network address behind a TLS reverse
+proxy, give the control API its own port, require client tokens:
 
 ```toml
 [server]
 listen = "0.0.0.0:18765"
 require_client = true
+
+[control]
+listen = "0.0.0.0:18766"   # /_hedge/* is then not reachable on the proxy port
+
+[witness]
+rotate_mb = 64             # close a segment at this size; the chain runs on
 ```
 
+Hedge is a single-instance service: one process per witness chain, never two
+replicas.
+
+**Developers and admins.** One token each; Hedge stores only the hash.
+
 ```bash
-hedge client add alice     # prints a token once, stores only its hash, live without restart
+hedge client add alice                 # prints the token once, live without restart
+hedge client add ci --expires 2027-01-31 --daily-tokens 500000
+hedge client rotate alice              # also: remove, list; --print for configs kept in Git
+hedge admin add anna                   # approvals carry her name in the witness
 ```
 
 Each developer sets `ANTHROPIC_BASE_URL` and
-`ANTHROPIC_CUSTOM_HEADERS="x-hedge-client-token: <token>"`. Every witness
-entry, metric and report line then carries the client name. Terminate TLS in
-front of Hedge (ingress, reverse proxy).
+`ANTHROPIC_CUSTOM_HEADERS="x-hedge-client-token: <token>"`
+([deploy/clients/claude-code](deploy/clients/claude-code/README.md) has the
+managed settings for a whole organisation). Every witness entry, metric and
+report line then carries the client name.
+
+**From an admin's own machine.** `HEDGE_URL` and `HEDGE_CONTROL_TOKEN` are
+all the CLI needs – no config, no file access:
+
+```bash
+hedge status        hedge approvals      hedge approve <id>
+hedge tail -f       hedge sessions       hedge report --since 7d
+hedge watch         hedge rotate         hedge presidio status
+```
 
 **Policy without restarts.** Hedge reloads `hedge.toml` when it changes (or
 on SIGHUP). A broken config is rejected and the previous one stays active.
@@ -422,26 +454,32 @@ daily_tokens   = 2_000_000    # per client and day (input without cache reads + 
 session_tokens = 500_000      # per agent session
 ```
 
+**Health.** `/health` says the process answers. `GET /ready` (no token) is
+200 only while Hedge serves requests the way the config demands: it answers
+503 with the reasons while the witness cannot be written, while Hedge is
+shutting down, or while Presidio is missing although nothing may leave
+without it. `hedge ready` is the same check as a command (exit code 0 or 1),
+for container health checks. On SIGTERM running answers get
+`server.shutdown_grace_secs` to finish; what is still running after that is
+recorded as cut off.
+
 **Observability.** `[telemetry] enabled = true` exports OTLP/HTTP traces and
 metrics. One span per request, all requests of an agent session in one
 trace. Metrics: `hedge_requests`, `hedge_findings`, `hedge_tool_calls`,
 `hedge_tokens`, `hedge_request_duration_ms`, `hedge_witness_errors`, and
-for Presidio `hedge_presidio_up`, `hedge_presidio_texts` (analyzed, cached,
-failed), `hedge_presidio_duration_ms`, `hedge_presidio_unscanned`.
+`hedge_up` as a heartbeat; for Presidio `hedge_presidio_up`,
+`hedge_presidio_texts` (analyzed, cached, failed),
+`hedge_presidio_duration_ms`, `hedge_presidio_unscanned`.
 
 ```bash
 docker compose -f deploy/compose/docker-compose.yml up -d   # Grafana + Tempo + Prometheus
 open http://localhost:3000                                  # Dashboards → Hedge
 ```
 
-The stack ships a dashboard and five alert rules (high-severity finding,
-tool call stopped, witness write failed, Presidio not ready, requests that
-passed without the Presidio check). `log.format = "json"` gives one
-JSON object per request for Loki, Datadog or Splunk.
-
-**Remote control.** `hedge status|approvals|approve|deny` and `hedge presidio
-status` take `--url` and `--token` (or `HEDGE_URL`, `HEDGE_CONTROL_TOKEN`) to
-talk to a central Hedge.
+The stack ships a dashboard and six alert rules (high-severity finding,
+tool call stopped, witness write failed, no heartbeat, Presidio not ready,
+requests that passed without the Presidio check). `log.format = "json"`
+gives one JSON object per request for Loki, Datadog or Splunk.
 
 ## Configuration
 
@@ -483,6 +521,12 @@ for every JSON API.
   with `approve_in_chat = false` and approve from another machine.
 - Cutting off the newest witness entries is invisible in the file alone;
   that is what `hedge head`, `--anchor` and the telemetry export are for.
+- If the witness cannot be written (disk full), requests still pass, without
+  a record. Hedge says so – log, metric, alert, `/ready` – and the file stays
+  intact. Let your platform act on `/ready` if you want no traffic without a
+  record.
+- Hedge passes provider credentials through and holds none. A developer with
+  their own API key can reach the provider without Hedge.
 - Findings in model answers are reported, not masked.
 - Presidio receives prompts in clear text and has no login of its own. Keep
   it on loopback (what `hedge presidio enable` does) or on a network only
@@ -496,8 +540,9 @@ for every JSON API.
 ## Development
 
 ```bash
-cargo test            # 218 unit tests, 40 integration tests against a mock LLM API and a
-                      # fake Presidio, 3 tests that drive the binary with a fake docker
+cargo test            # 238 unit tests, 53 integration tests against a mock LLM API and a
+                      # fake Presidio (one of them fills the disk under the witness),
+                      # 3 tests that drive the binary with a fake docker
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```

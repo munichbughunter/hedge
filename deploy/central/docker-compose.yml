@@ -1,4 +1,5 @@
-# Hedge zentral: Hedge und Presidio auf einem Host, dazu auf Wunsch Grafana.
+# Hedge zentral: Hedge und Presidio auf einem Host, dazu auf Wunsch Caddy
+# (TLS) und Grafana.
 # Geschrieben von `hedge deploy compose` (Hedge {{VERSION}}).
 # Die Schritte stehen in README.md in diesem Verzeichnis.
 name: hedge
@@ -15,13 +16,46 @@ services:
       # Standard: nur von diesem Host erreichbar. Davor gehört ein Reverse
       # Proxy, der TLS terminiert (README, Abschnitt "TLS").
       - "${HEDGE_BIND:-127.0.0.1}:${HEDGE_PORT:-18765}:18765"
+      # Die Steuer-API (hedge status, Freigaben, hedge watch) hat ihre eigene
+      # Adresse; am Port darüber gibt es /_hedge/* nicht.
+      - "${HEDGE_CONTROL_BIND:-127.0.0.1}:${HEDGE_CONTROL_PORT:-18766}:18766"
     volumes:
       # Die Config liegt neben dieser Datei. Hedge liest Änderungen binnen
       # Sekunden neu ein; der Container selbst kann sie nicht ändern.
       - ./hedge:/etc/hedge:ro
       # Witness, Signierschlüssel, Steuer-Token.
       - hedge-data:/var/lib/hedge
+    # Etwas länger als server.shutdown_grace_secs (30): Laufende Antworten
+    # dürfen beim Beenden fertig werden.
+    stop_grace_period: 40s
+    # Braucht der Host einen Forward Proxy, um die LLM-API zu erreichen:
+    # environment:
+    #   HTTPS_PROXY: http://proxy.example.com:3128
+    #   NO_PROXY: presidio,lgtm,localhost,127.0.0.1
     networks: [default, guard]
+
+  # TLS ohne eigenen Reverse Proxy: Caddy terminiert HTTPS, reicht Antworten
+  # ungepuffert durch und lässt /_hedge/* nur aus dem Admin-Netz zu.
+  # Einschalten: COMPOSE_PROFILES=tls in .env, dazu HEDGE_DOMAIN (README,
+  # Abschnitt "TLS").
+  caddy:
+    profiles: [tls]
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      hedge:
+        condition: service_healthy
+    ports:
+      - "${HEDGE_HTTPS_PORT:-443}:443"
+    environment:
+      HEDGE_DOMAIN: ${HEDGE_DOMAIN:-localhost}
+      HEDGE_TLS: ${HEDGE_TLS:-internal}
+      HEDGE_ADMIN_CIDRS: ${HEDGE_ADMIN_CIDRS:-127.0.0.1/32}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+      - caddy-data:/data
+      - caddy-config:/config
 
   presidio:
     image: ${PRESIDIO_IMAGE}
@@ -58,4 +92,6 @@ networks:
 
 volumes:
   hedge-data:
+  caddy-data:
+  caddy-config:
   lgtm-data:

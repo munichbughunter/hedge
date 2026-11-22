@@ -172,3 +172,40 @@ groups:
                   query: { params: [C] }
                   reducer: { type: last }
                   type: query
+
+      # Hedge sends the metric hedge_up (always 1) with every export. When it
+      # stops arriving, Hedge is down or cannot reach the collector – without
+      # this rule an outage looks like a quiet afternoon, because the other
+      # rules treat "no data" as "nothing happened".
+      - uid: hedge-no-heartbeat
+        title: "Hedge: no heartbeat"
+        condition: C
+        for: 2m
+        noDataState: Alerting
+        execErrState: Alerting
+        labels:
+          severity: critical
+        annotations:
+          summary: "Hedge has not reported for more than two minutes. Agents pointed at it cannot reach the LLM API."
+          description: "Check the process (`systemctl status hedge`, `docker compose ps`, `kubectl get pods`) and `hedge ready`."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max(max_over_time(hedge_up[2m]))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              datasource: { type: __expr__, uid: __expr__ }
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last }
+                  type: query

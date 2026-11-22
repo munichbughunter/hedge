@@ -11,6 +11,8 @@ mode = "observe"                 # [scharf] redact = maskieren, block = ablehnen
 [server]
 listen = "0.0.0.0:18765"
 require_client = {{REQUIRE_CLIENT}}           # nur Anfragen mit Client-Token annehmen
+# max_body_mb = 10               # größte Anfrage; der Proxy davor muss mindestens so viel durchlassen
+# shutdown_grace_secs = 30       # so lange dürfen laufende Antworten beim Beenden fertig werden
 
 [log]
 format = "json"
@@ -18,9 +20,15 @@ format = "json"
 [witness]
 path = "/var/lib/hedge/witness.jsonl"
 key  = "/var/lib/hedge/witness.key"
+rotate_mb = 64                   # ab dieser Größe ein Segment schließen; die Kette läuft weiter
 
+# Die Steuer-API (/_hedge/*) hat ihre eigene Adresse und ist am Port der
+# Agents nicht erreichbar. Das lokale Token liegt im Volume; für Menschen
+# gibt es benannte Admins, deren Name bei jeder Freigabe im Witness steht:
+#   hedge --config hedge/hedge.toml admin add <name>
 [control]
 token = "/var/lib/hedge/control.token"
+listen = "0.0.0.0:18766"
 
 # Traces und Metriken nach Grafana (Profil "observability" in .env).
 [telemetry]

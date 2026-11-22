@@ -33,6 +33,8 @@ pub struct Config {
     pub budget: Budget,
     /// Bekannte Clients im Central-Mode.
     pub clients: Vec<Client>,
+    /// Benannte Admins für die Steuer-API (zusätzlich zum lokalen Token).
+    pub admins: Vec<Admin>,
     pub control: Control,
     pub telemetry: Telemetry,
     pub presidio: Presidio,
@@ -64,6 +66,7 @@ impl Default for Config {
             models: Models::default(),
             budget: Budget::default(),
             clients: Vec::new(),
+            admins: Vec::new(),
             control: Control::default(),
             telemetry: Telemetry::default(),
             presidio: Presidio::default(),
@@ -77,6 +80,11 @@ pub struct Server {
     pub listen: String,
     /// Central-Mode: Anfragen ohne gültiges Client-Token ablehnen.
     pub require_client: bool,
+    /// Größter Request-Body in MiB; größere Anfragen werden mit 413 abgelehnt.
+    pub max_body_mb: u64,
+    /// So lange dürfen laufende Antworten nach SIGTERM noch zu Ende gehen.
+    /// 0 = ohne Frist warten.
+    pub shutdown_grace_secs: u64,
 }
 
 impl Default for Server {
@@ -84,7 +92,15 @@ impl Default for Server {
         Self {
             listen: "127.0.0.1:18765".into(),
             require_client: false,
+            max_body_mb: 10,
+            shutdown_grace_secs: 30,
         }
+    }
+}
+
+impl Server {
+    pub fn max_body_bytes(&self) -> usize {
+        (self.max_body_mb as usize).saturating_mul(1024 * 1024)
     }
 }
 
@@ -200,6 +216,9 @@ pub struct Witness {
     /// Maskierten Hinweis pro Fund mitschreiben (`p…@example.com`, `…a1b2`),
     /// damit ein Mensch erkennt, welche Adresse oder welcher Key gemeint ist.
     pub hints: bool,
+    /// Ab dieser Größe (MiB) beginnt Hedge ein neues Segment; das alte liegt
+    /// als `<name>.<erste>-<letzte>.jsonl` daneben. 0 = nie rotieren.
+    pub rotate_mb: u64,
 }
 
 impl Default for Witness {
@@ -210,6 +229,7 @@ impl Default for Witness {
             key: "~/.hedge/witness.key".into(),
             tool_preview: true,
             hints: true,
+            rotate_mb: 0,
         }
     }
 }
@@ -332,6 +352,37 @@ pub struct Client {
     pub name: String,
     /// SHA-256 (hex) des Client-Tokens. Das Token selbst steht nie in der Config.
     pub token_sha256: String,
+    /// Eigenes Tagesbudget; ohne Angabe gilt `[budget] daily_tokens`.
+    #[serde(default)]
+    pub daily_tokens: Option<u64>,
+    /// Letzter gültiger Tag (`JJJJ-MM-TT`, UTC). Danach wird das Token abgelehnt.
+    #[serde(default)]
+    pub expires: Option<String>,
+}
+
+impl Client {
+    /// Ist das Token an diesem UTC-Tag (`JJJJ-MM-TT`) abgelaufen?
+    pub fn expired_on(&self, today: &str) -> bool {
+        self.expires.as_deref().is_some_and(|e| e < today)
+    }
+}
+
+/// Ein Admin der Steuer-API. Jede Freigabe trägt seinen Namen im Witness.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Admin {
+    pub name: String,
+    /// SHA-256 (hex) des Admin-Tokens. Anlegen mit `hedge admin add`.
+    pub token_sha256: String,
+}
+
+/// Namen landen in Log, Witness und Metriken: kurz und ohne Sonderzeichen.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,12 +390,16 @@ pub struct Client {
 pub struct Control {
     /// Token für die Steuer-API (Freigaben, Status). Erzeugt `hedge init`.
     pub token: String,
+    /// Eigene Adresse nur für die Steuer-API. Gesetzt: `/_hedge/*` ist auf
+    /// dem Proxy-Port nicht mehr erreichbar. Leer: beides auf `server.listen`.
+    pub listen: String,
 }
 
 impl Default for Control {
     fn default() -> Self {
         Self {
             token: "~/.hedge/control.token".into(),
+            listen: String::new(),
         }
     }
 }
@@ -733,10 +788,61 @@ impl Config {
                 )));
             }
         }
+        for c in &self.clients {
+            if let Some(day) = &c.expires
+                && chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_err()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "client {:?}: expires {day:?} is not a date (use YYYY-MM-DD)",
+                    c.name
+                )));
+            }
+        }
         if self.server.require_client && self.clients.is_empty() {
             return Err(ConfigError::Invalid(
                 "server.require_client = true but no [[clients]] configured".into(),
             ));
+        }
+        let mut admins = HashSet::new();
+        for a in &self.admins {
+            // Der Name steht im Witness-Ereignis jeder Freigabe.
+            if !valid_name(&a.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "admin name {:?} must be 1–64 characters of a-z, A-Z, 0-9, '-', '_', '.', '@'",
+                    a.name
+                )));
+            }
+            if !admins.insert(&a.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "admin name {:?} is used twice",
+                    a.name
+                )));
+            }
+            if a.token_sha256.len() != 64 || hex::decode(&a.token_sha256).is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "admin {:?}: token_sha256 must be 64 hex characters (use `hedge admin add`)",
+                    a.name
+                )));
+            }
+        }
+        if self.server.max_body_mb == 0 || self.server.max_body_mb > 1024 {
+            return Err(ConfigError::Invalid(
+                "server.max_body_mb must be between 1 and 1024".into(),
+            ));
+        }
+        if !self.control.listen.is_empty() {
+            if self.control.listen.parse::<std::net::SocketAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "control.listen {:?} is not a socket address (e.g. 127.0.0.1:18766)",
+                    self.control.listen
+                )));
+            }
+            if self.control.listen == self.server.listen {
+                return Err(ConfigError::Invalid(
+                    "control.listen must differ from server.listen (leave it empty to share the port)"
+                        .into(),
+                ));
+            }
         }
         if self.telemetry.enabled
             && !(self.telemetry.endpoint.starts_with("http://")
@@ -834,6 +940,32 @@ impl Config {
         expand_tilde(&self.control.token)
     }
 
+    /// Eigene Adresse der Steuer-API, falls eine gesetzt ist.
+    pub fn control_listen(&self) -> Option<&str> {
+        (!self.control.listen.is_empty()).then_some(self.control.listen.as_str())
+    }
+
+    /// Wo die Steuer-API zu erreichen ist: auf ihrer eigenen Adresse oder
+    /// auf dem Proxy-Port. Aus `0.0.0.0` wird die Loopback-Adresse, denn
+    /// dorthin verbindet sich das CLI auf demselben Rechner.
+    pub fn control_url(&self) -> String {
+        local_url(self.control_listen().unwrap_or(&self.server.listen))
+    }
+
+    /// Adresse des Proxys aus Sicht desselben Rechners.
+    pub fn proxy_url(&self) -> String {
+        local_url(&self.server.listen)
+    }
+
+    /// Tagesbudget für einen Client: sein eigenes, sonst das allgemeine.
+    pub fn daily_tokens_for(&self, client: &str) -> u64 {
+        self.clients
+            .iter()
+            .find(|c| c.name == client)
+            .and_then(|c| c.daily_tokens)
+            .unwrap_or(self.budget.daily_tokens)
+    }
+
     /// Lauscht Hedge nur auf Loopback?
     pub fn is_loopback(&self) -> bool {
         self.server
@@ -853,6 +985,17 @@ impl Config {
 
     pub fn witness_key_path(&self) -> PathBuf {
         expand_tilde(&self.witness.key)
+    }
+}
+
+/// `http://host:port` für eine Listen-Adresse, erreichbar vom selben Rechner.
+pub fn local_url(listen: &str) -> String {
+    match listen.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => {
+            let host = if addr.is_ipv4() { "127.0.0.1" } else { "[::1]" };
+            format!("http://{host}:{}", addr.port())
+        }
+        _ => format!("http://{listen}"),
     }
 }
 
@@ -993,6 +1136,8 @@ mode = "observe"
 [server]
 listen = "127.0.0.1:18765"
 # require_client = false   # Central-Mode: nur Anfragen mit Client-Token annehmen
+# max_body_mb = 10         # größere Anfragen lehnt Hedge mit 413 ab
+# shutdown_grace_secs = 30 # so lange dürfen Antworten beim Beenden noch zu Ende laufen (0 = ohne Frist)
 
 # Jeder Upstream ist unter /<name>/... erreichbar. Andere Ziele gibt es nicht.
 [[upstreams]]
@@ -1077,10 +1222,14 @@ url = "https://api.openai.com"
 # key  = "~/.hedge/witness.key"
 # tool_preview = true   # kurze, maskierte Vorschau jedes Tool-Aufrufs
 # hints = true          # maskierter Hinweis pro Fund: p…@example.com, …a1b2
+# rotate_mb = 0         # ab dieser Größe ein neues Segment beginnen (0 = nie);
+#                       # von Hand: hedge rotate. Die Kette läuft über Segmente weiter.
 
 # Steuer-API (hedge approve, hedge status). Das Token erzeugt `hedge init`.
 [control]
 # token = "~/.hedge/control.token"
+# listen = "127.0.0.1:18766"   # eigene Adresse nur für die Steuer-API; dann ist
+#                              # /_hedge/* auf dem Proxy-Port nicht mehr erreichbar
 
 # OpenTelemetry (OTLP/HTTP): Traces und Metriken nach Grafana & Co.
 # Stack zum Ausprobieren: deploy/compose/docker-compose.yml
@@ -1117,6 +1266,14 @@ url = "https://api.openai.com"
 # Central-Mode: bekannte Clients. Anlegen mit: hedge client add <name>
 # [[clients]]
 # name = "patrick"
+# token_sha256 = "…"
+# daily_tokens = 500000    # eigenes Tagesbudget statt [budget] daily_tokens
+# expires = "2027-01-31"   # letzter gültiger Tag (UTC)
+
+# Admins der Steuer-API. Anlegen mit: hedge admin add <name>
+# Jede Freigabe trägt den Namen im Witness; das lokale Token gilt weiter.
+# [[admins]]
+# name = "anna"
 # token_sha256 = "…"
 "#;
 
@@ -1465,5 +1622,130 @@ mod tests {
         let p = expand_tilde("~/.hedge/x");
         assert!(!p.to_string_lossy().starts_with('~'));
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn central_options_parse_with_sane_defaults() {
+        let d = Config::default();
+        assert_eq!(d.server.max_body_mb, 10);
+        assert_eq!(d.server.max_body_bytes(), 10 * 1024 * 1024);
+        assert_eq!(d.server.shutdown_grace_secs, 30);
+        assert_eq!(d.witness.rotate_mb, 0, "rotation is opt-in");
+        assert!(d.control_listen().is_none());
+        assert!(d.admins.is_empty());
+
+        let cfg = Config::from_toml(&format!(
+            r#"
+            [server]
+            listen = "0.0.0.0:18765"
+            max_body_mb = 32
+            shutdown_grace_secs = 0
+            [witness]
+            rotate_mb = 64
+            [control]
+            listen = "127.0.0.1:18766"
+            [[admins]]
+            name = "anna"
+            token_sha256 = "{SHA}"
+            [[clients]]
+            name = "ben"
+            token_sha256 = "{SHA}"
+            daily_tokens = 5000
+            expires = "2027-01-31"
+            "#
+        ))
+        .expect("parses");
+        cfg.validate().expect("valid");
+        assert_eq!(cfg.server.max_body_mb, 32);
+        assert_eq!(cfg.witness.rotate_mb, 64);
+        assert_eq!(cfg.control_listen(), Some("127.0.0.1:18766"));
+        assert_eq!(cfg.admins[0].name, "anna");
+        assert_eq!(cfg.clients[0].daily_tokens, Some(5000));
+    }
+
+    #[test]
+    fn urls_for_the_same_machine_never_use_the_wildcard_address() {
+        assert_eq!(local_url("0.0.0.0:18765"), "http://127.0.0.1:18765");
+        assert_eq!(local_url("[::]:18765"), "http://[::1]:18765");
+        assert_eq!(local_url("10.0.0.5:18765"), "http://10.0.0.5:18765");
+
+        let shared = Config::from_toml("[server]\nlisten = \"0.0.0.0:18765\"").unwrap();
+        assert_eq!(shared.control_url(), "http://127.0.0.1:18765");
+        assert_eq!(shared.proxy_url(), "http://127.0.0.1:18765");
+        let split = Config::from_toml(
+            "[server]\nlisten = \"0.0.0.0:18765\"\n[control]\nlisten = \"127.0.0.1:18766\"",
+        )
+        .unwrap();
+        assert_eq!(split.control_url(), "http://127.0.0.1:18766");
+        assert_eq!(split.proxy_url(), "http://127.0.0.1:18765");
+    }
+
+    #[test]
+    fn a_client_budget_overrides_the_general_one() {
+        let cfg = Config::from_toml(&format!(
+            "[budget]\ndaily_tokens = 1000\n[[clients]]\nname = \"big\"\ntoken_sha256 = \"{SHA}\"\ndaily_tokens = 9000\n[[clients]]\nname = \"plain\"\ntoken_sha256 = \"{SHA}\""
+        ))
+        .unwrap();
+        assert_eq!(cfg.daily_tokens_for("big"), 9000);
+        assert_eq!(cfg.daily_tokens_for("plain"), 1000);
+        assert_eq!(cfg.daily_tokens_for("local"), 1000);
+    }
+
+    #[test]
+    fn client_tokens_expire_after_their_last_day() {
+        let c = Client {
+            name: "ben".into(),
+            token_sha256: SHA.into(),
+            daily_tokens: None,
+            expires: Some("2026-11-20".into()),
+        };
+        assert!(!c.expired_on("2026-11-19"));
+        assert!(!c.expired_on("2026-11-20"), "the last day still counts");
+        assert!(c.expired_on("2026-11-21"));
+    }
+
+    #[test]
+    fn central_options_are_validated() {
+        let bad = |toml: &str| -> String {
+            Config::from_toml(toml)
+                .expect("parses")
+                .validate()
+                .expect_err("must be rejected")
+                .to_string()
+        };
+        assert!(bad("[server]\nmax_body_mb = 0").contains("max_body_mb"));
+        assert!(bad("[control]\nlisten = \"nope\"").contains("control.listen"));
+        assert!(
+            bad("[control]\nlisten = \"127.0.0.1:18765\"").contains("must differ"),
+            "control and proxy cannot share an address explicitly"
+        );
+        assert!(
+            bad(&format!(
+                "[[admins]]\nname = \"an na\"\ntoken_sha256 = \"{SHA}\""
+            ))
+            .contains("admin name")
+        );
+        assert!(
+            bad(&format!(
+                "[[admins]]\nname = \"a · b\"\ntoken_sha256 = \"{SHA}\""
+            ))
+            .contains("admin name"),
+            "the name ends up in witness text split at ' · '"
+        );
+        assert!(
+            bad(&format!(
+                "[[admins]]\nname = \"anna\"\ntoken_sha256 = \"{SHA}\"\n[[admins]]\nname = \"anna\"\ntoken_sha256 = \"{SHA}\""
+            ))
+            .contains("twice")
+        );
+        assert!(bad("[[admins]]\nname = \"anna\"\ntoken_sha256 = \"abc\"").contains("64 hex"));
+        assert!(
+            bad(&format!(
+                "[[clients]]\nname = \"ben\"\ntoken_sha256 = \"{SHA}\"\nexpires = \"31.01.2027\""
+            ))
+            .contains("YYYY-MM-DD")
+        );
     }
 }

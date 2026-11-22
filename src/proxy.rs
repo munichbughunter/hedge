@@ -9,14 +9,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{Path as UrlPath, Request, State},
+    extract::{Path as UrlPath, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -29,7 +29,7 @@ use tracing::{error, info, warn};
 
 use crate::approvals::{ApprovalInfo, Approvals, GrantKey, Verdict, parse_chat_command};
 use crate::budget::{Budgets, LOCAL};
-use crate::config::{Config, Models, ToolAction};
+use crate::config::{Budget, Config, Models, ToolAction};
 use crate::detect::Detectors;
 use crate::inspect::{
     Action, Extra, Outcome, Prepared, Rules, hint_for, inspect, redact, session_label,
@@ -42,9 +42,12 @@ use crate::sse::{
 };
 use crate::telemetry::Telemetry;
 use crate::tools::{ToolPolicy, approval_fingerprint, display, first_string, glob_match, subject};
-use crate::witness::{Anchor, FindingRecord, Record, ToolRecord, Witness, sha256_hex};
+use crate::witness::{
+    Anchor, Entry, FindingRecord, Record, Recovered, Segment, ToolRecord, Witness, sha256_hex,
+};
 
-const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// So viel Witness liefert die Steuer-API höchstens pro Abruf.
+const WITNESS_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// So viele Tool-Aufruf-IDs merkt sich Hedge für den Abgleich mit Ergebnissen.
 const MAX_SEEN_TOOLS: usize = 20_000;
 /// Header, mit dem sich ein Client im Central-Mode ausweist.
@@ -62,8 +65,10 @@ pub struct Runtime {
     pub rules: Rules,
     pub tools: ToolPolicy,
     pub presidio: Option<Arc<Presidio>>,
-    /// SHA-256 des Client-Tokens → Name.
-    clients: HashMap<String, String>,
+    /// SHA-256 des Client-Tokens → Name und letzter gültiger Tag.
+    clients: HashMap<String, (String, Option<String>)>,
+    /// SHA-256 des Admin-Tokens → Name.
+    admins: HashMap<String, String>,
 }
 
 impl Runtime {
@@ -76,7 +81,14 @@ impl Runtime {
     /// überleben so jeden Reload, der Presidio nicht betrifft.
     pub fn build_reusing(cfg: Config, old: Option<&Runtime>) -> Result<Self, Box<dyn Error>> {
         cfg.validate()?;
-        let client = build_client(&cfg)?;
+        // Scheitert hier meist am Vertrauensspeicher: Ohne CA-Zertifikate
+        // lässt sich kein HTTPS-Client bauen.
+        let client = build_client(&cfg).map_err(|e| {
+            format!(
+                "cannot set up the HTTPS client ({}). Is the system CA store there (package ca-certificates), and do SSL_CERT_FILE / SSL_CERT_DIR point to something that exists?",
+                root_cause(&e)
+            )
+        })?;
         let tools = ToolPolicy::from_config(&cfg.tools)?;
         let presidio = if cfg.presidio.enabled {
             match old.and_then(|o| o.presidio.as_ref()) {
@@ -89,7 +101,17 @@ impl Runtime {
         let clients = cfg
             .clients
             .iter()
-            .map(|c| (c.token_sha256.to_ascii_lowercase(), c.name.clone()))
+            .map(|c| {
+                (
+                    c.token_sha256.to_ascii_lowercase(),
+                    (c.name.clone(), c.expires.clone()),
+                )
+            })
+            .collect();
+        let admins = cfg
+            .admins
+            .iter()
+            .map(|a| (a.token_sha256.to_ascii_lowercase(), a.name.clone()))
             .collect();
         Ok(Self {
             detectors: Detectors::from_toggles(&cfg.detectors),
@@ -98,16 +120,82 @@ impl Runtime {
             tools,
             presidio,
             clients,
+            admins,
             cfg,
         })
     }
 
-    fn client_of(&self, headers: &HeaderMap) -> Option<String> {
-        let token = headers.get(CLIENT_TOKEN_HEADER)?.to_str().ok()?;
-        self.clients
-            .get(&sha256_hex(token.trim().as_bytes()))
-            .cloned()
+    /// Der Client hinter dem Token. `Err` mit Begründung, wenn das Token
+    /// bekannt, aber abgelaufen ist; `Ok(None)`, wenn keines oder ein
+    /// unbekanntes mitkam.
+    fn client_of(&self, headers: &HeaderMap) -> Result<Option<String>, String> {
+        let Some(token) = headers
+            .get(CLIENT_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return Ok(None);
+        };
+        match self.clients.get(&sha256_hex(token.trim().as_bytes())) {
+            Some((name, Some(day))) if day.as_str() < today().as_str() => {
+                Err(format!("the client token of {name} expired on {day}"))
+            }
+            Some((name, _)) => Ok(Some(name.clone())),
+            None => Ok(None),
+        }
     }
+
+    fn admin_of(&self, token: &str) -> Option<&str> {
+        self.admins
+            .get(&sha256_hex(token.as_bytes()))
+            .map(String::as_str)
+    }
+
+    /// Die Budgets, die für diesen Client gelten.
+    fn budget_for(&self, client: &str) -> Budget {
+        Budget {
+            daily_tokens: self.cfg.daily_tokens_for(client),
+            session_tokens: self.cfg.budget.session_tokens,
+        }
+    }
+}
+
+/// Wächter einer laufenden Anfrage. Endet sie – regulär oder mit einem
+/// Fehler –, verschwindet sie aus der Liste der laufenden.
+struct InFlight {
+    state: Arc<AppState>,
+    id: u64,
+}
+
+impl InFlight {
+    /// Nimmt die Anfrage aus der Liste der laufenden. `false`, wenn sie
+    /// dort schon fehlt: Dann hat das Herunterfahren sie als abgebrochen
+    /// bezeugt, und ein zweiter Eintrag wäre einer zu viel.
+    fn claim(&self) -> bool {
+        self.state
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id)
+            .is_some()
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.state
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+fn today() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+fn file_name(path: &Path) -> &str {
+    path.file_name().and_then(|n| n.to_str()).unwrap_or("-")
 }
 
 pub fn build_client(cfg: &Config) -> reqwest::Result<reqwest::Client> {
@@ -202,6 +290,14 @@ pub struct AppState {
     presidio_wake: tokio::sync::Notify,
     /// Wann die Aufsicht zuletzt nach dem Container gesehen hat.
     sidecar_checked: Mutex<Option<Instant>>,
+    /// Der letzte Schreibversuch in den Witness ist gelungen.
+    witness_ok: AtomicBool,
+    witness_error: Mutex<Option<String>>,
+    /// Hedge fährt herunter und nimmt keine neue Arbeit mehr an.
+    draining: AtomicBool,
+    /// Anfragen, die beim Upstream liegen und deren Antwort noch läuft.
+    in_flight: Mutex<HashMap<u64, (Record, Instant, String)>>,
+    next_in_flight: AtomicU64,
 }
 
 impl AppState {
@@ -219,6 +315,11 @@ impl AppState {
             stats: Stats::default(),
             presidio_wake: tokio::sync::Notify::new(),
             sidecar_checked: Mutex::new(None),
+            witness_ok: AtomicBool::new(true),
+            witness_error: Mutex::new(None),
+            draining: AtomicBool::new(false),
+            in_flight: Mutex::new(HashMap::new()),
+            next_in_flight: AtomicU64::new(0),
         }
     }
 
@@ -235,10 +336,17 @@ impl AppState {
     /// Baut den State komplett aus der Config: Runtime, Witness, Telemetrie,
     /// Steuer-Token; Budgets und bekannte Tool-Aufrufe aus dem Witness.
     pub fn from_config(cfg: Config) -> Result<Self, Box<dyn Error>> {
-        let witness = if cfg.witness.enabled {
-            Some(Witness::open(&cfg.witness_path(), &cfg.witness_key_path())?)
+        let opened = if cfg.witness.enabled {
+            Some(Witness::open_full(
+                &cfg.witness_path(),
+                &cfg.witness_key_path(),
+            )?)
         } else {
             None
+        };
+        let (witness, entries, recovered) = match opened {
+            Some(o) => (Some(o.witness), o.entries, o.recovered),
+            None => (None, Vec::new(), None),
         };
         let telemetry = Telemetry::init(&cfg.telemetry)?;
         let token = std::fs::read_to_string(cfg.control_token_path())
@@ -247,15 +355,47 @@ impl AppState {
         let state = Self::new(Runtime::build(cfg)?, witness)
             .with_control_token(token)
             .with_telemetry(telemetry);
-        state.restore_from_witness();
+        state.restore_from(entries);
+        if let Some(r) = recovered {
+            state.note_recovery(&r);
+        }
         Ok(state)
     }
 
-    fn restore_from_witness(&self) {
+    /// Eine abgerissene letzte Zeile wurde beim Start entfernt: laut sagen
+    /// und bezeugen, damit es in der Kette steht.
+    fn note_recovery(&self, r: &Recovered) {
+        warn!(
+            bytes = r.bytes,
+            saved_to = %r.saved_to.display(),
+            "the witness ended in an incomplete line (crash or full disk); it was saved aside and removed"
+        );
+        self.record_event(
+            "recovered",
+            format!(
+                "removed an incomplete last line: {} bytes, sha256={}, saved to {}",
+                r.bytes,
+                r.sha256,
+                file_name(&r.saved_to)
+            ),
+        );
+    }
+
+    /// Stellt Budgets und bekannte Tool-Aufrufe aus dem Witness wieder her.
+    /// `entries` sind die des aktiven Segments. Beginnt es erst heute, liegt
+    /// der Rest des Tages in abgelegten Segmenten – die werden nachgelesen.
+    fn restore_from(&self, mut entries: Vec<Entry>) {
         let Some(w) = &self.witness else { return };
-        let Ok(entries) = crate::witness::read_entries(w.path()) else {
-            return;
-        };
+        let day = today();
+        let from_today = |e: &[Entry]| e.first().is_none_or(|e| e.ts.starts_with(&day));
+        if from_today(&entries) && !crate::witness::segments(w.path()).is_empty() {
+            match crate::witness::read_back(w.path(), |e| !from_today(e)) {
+                Ok(all) => entries = all,
+                Err(e) => {
+                    warn!(error = %e, "could not read older witness segments; today's budgets may start too low")
+                }
+            }
+        }
         self.budgets.seed(&entries);
         let mut seen = self.seen_tools.lock().unwrap_or_else(|e| e.into_inner());
         let from = entries.len().saturating_sub(5_000);
@@ -282,8 +422,112 @@ impl AppState {
         self.telemetry.as_ref()
     }
 
+    /// Kann überhaupt jemand eine Freigabe erteilen? Dafür braucht es das
+    /// lokale Steuer-Token oder mindestens einen Admin.
     pub fn has_control_token(&self) -> bool {
-        self.control_token.is_some()
+        self.control_token.is_some() || !self.runtime().admins.is_empty()
+    }
+
+    /// Hedge fährt herunter: `/ready` meldet das ab jetzt.
+    pub fn set_draining(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+    }
+
+    /// Warum Hedge gerade keine Arbeit annehmen sollte, in einem Satz;
+    /// `None` = bereit. Die Gründe einzeln liefert [`Self::readiness`].
+    pub fn not_ready(&self) -> Option<String> {
+        self.readiness().err().map(|waiting| waiting.join(", "))
+    }
+
+    /// Merkt sich eine Anfrage, die jetzt zum Upstream geht. Solange der
+    /// zurückgegebene Wächter lebt, gilt sie als laufend.
+    fn track(self: &Arc<Self>, rec: &Record, started: Instant, budget_key: &str) -> InFlight {
+        let id = self.next_in_flight.fetch_add(1, Ordering::Relaxed);
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, (rec.clone(), started, budget_key.to_owned()));
+        InFlight {
+            state: self.clone(),
+            id,
+        }
+    }
+
+    /// Bezeugt alle Anfragen, deren Antwort beim Beenden noch lief, als
+    /// abgebrochen. Ohne das fehlte von ihnen jede Spur: Der Prompt ist
+    /// längst beim Upstream, aber der Eintrag entsteht erst am Ende der
+    /// Antwort. Liefert, wie viele es waren.
+    pub fn witness_cut_off(&self) -> usize {
+        let running: Vec<(Record, Instant, String)> = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, v)| v)
+            .collect();
+        let n = running.len();
+        for (mut rec, started, budget_key) in running {
+            rec.aborted = true;
+            rec.detail = Some("cut off: hedge shut down before the answer ended".into());
+            self.complete(rec, started, &budget_key);
+        }
+        n
+    }
+
+    /// Legt das aktive Witness-Segment ab und bezeugt das als ersten Eintrag
+    /// des neuen. `Ok(None)`, wenn es nichts abzulegen gab.
+    pub fn rotate_witness(&self, why: &str) -> Result<Option<Segment>, String> {
+        self.rotate_witness_from(0, why)
+    }
+
+    /// Rotiert, wenn das aktive Segment mindestens `min_bytes` groß ist.
+    fn rotate_witness_from(&self, min_bytes: u64, why: &str) -> Result<Option<Segment>, String> {
+        let Some(w) = &self.witness else {
+            return Err("the witness is disabled".into());
+        };
+        let mode = self.runtime().cfg.mode.as_str().to_owned();
+        let mut noted = None;
+        let rotated = w.rotate_noting(min_bytes, |seg| {
+            let rec = Record {
+                upstream: "-".into(),
+                method: "-".into(),
+                path: "-".into(),
+                mode,
+                action: "event".into(),
+                body_sha256_in: sha256_hex(b""),
+                event: Some("rotate".into()),
+                detail: Some(format!(
+                    "segment {} closed: entries #{} to #{}, {} bytes ({why})",
+                    file_name(&seg.path),
+                    seg.first,
+                    seg.last,
+                    seg.bytes
+                )),
+                ..Record::default()
+            };
+            noted = Some(rec.clone());
+            rec
+        });
+        match rotated {
+            Ok(Some((seg, entry))) => {
+                info!(segment = %file_name(&seg.path), first = seg.first, last = seg.last, "witness rotated ({why})");
+                if let (Some(t), Some(rec)) = (&self.telemetry, &noted) {
+                    t.record(
+                        rec,
+                        Some(&Anchor {
+                            seq: entry.seq,
+                            hash: entry.hash,
+                        }),
+                    );
+                }
+                Ok(Some(seg))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                error!(error = %e, "witness rotation failed");
+                Err(e.to_string())
+            }
+        }
     }
 
     /// Nach dem Container wird höchstens alle fünf Sekunden gesehen: Jeder
@@ -411,10 +655,19 @@ impl AppState {
     }
 
     /// Kann Hedge Anfragen so bedienen, wie die Config es verlangt?
-    /// `Err` nennt, worauf noch gewartet wird.
+    /// `Err` nennt die Gründe: Hedge fährt herunter, der Witness lässt sich
+    /// nicht schreiben, oder Presidio fehlt, obwohl ohne es nichts hinaus
+    /// darf. Ob ein Load Balancer darauf hört, ist eine Entscheidung: Wer es
+    /// tut, lässt ohne Protokoll keinen Traffic durch.
     pub fn readiness(&self) -> Result<(), Vec<String>> {
         let rt = self.runtime();
         let mut waiting = Vec::new();
+        if self.draining.load(Ordering::Relaxed) {
+            waiting.push("shutting down".to_owned());
+        }
+        if self.witness.is_some() && !self.witness_ok.load(Ordering::Relaxed) {
+            waiting.push("witness is failing".to_owned());
+        }
         if rt.cfg.presidio_fail_closed()
             && let Some(p) = &rt.presidio
             && p.state() != PresidioState::Ready
@@ -432,14 +685,20 @@ impl AppState {
     fn write(&self, rec: Record) {
         let anchor = match &self.witness {
             Some(w) => match w.record(rec.clone()) {
-                Ok(e) => Some(Anchor {
-                    seq: e.seq,
-                    hash: e.hash,
-                }),
+                Ok(e) => {
+                    self.witness_ok.store(true, Ordering::Relaxed);
+                    Some(Anchor {
+                        seq: e.seq,
+                        hash: e.hash,
+                    })
+                }
                 Err(e) => {
                     // Der Witness darf den Traffic nicht blockieren, aber sein
                     // Ausfall muss laut sein: Ohne Protokoll ist Hedge kein Guard.
                     error!(error = %e, "witness write failed");
+                    self.witness_ok.store(false, Ordering::Relaxed);
+                    *self.witness_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(e.to_string());
                     if let Some(t) = &self.telemetry {
                         t.witness_error();
                     }
@@ -450,6 +709,20 @@ impl AppState {
         };
         if let Some(t) = &self.telemetry {
             t.record(&rec, anchor.as_ref());
+        }
+        // Das Segment ist voll: ablegen und ein neues beginnen.
+        if anchor.is_some()
+            && let Some(w) = &self.witness
+        {
+            let limit = self
+                .runtime()
+                .cfg
+                .witness
+                .rotate_mb
+                .saturating_mul(1024 * 1024);
+            if limit > 0 && w.active().bytes >= limit {
+                let _ = self.rotate_witness_from(limit, "size limit reached");
+            }
         }
     }
 
@@ -510,16 +783,34 @@ impl AppState {
                 "approve_in_chat": rt.tools.approve_in_chat(),
                 "pending_approvals": self.approvals.len(),
             },
-            "witness": self.witness.as_ref().map(|w| json!({
-                "path": w.path().display().to_string(),
-                "key_id": w.key_id(),
-                "head": w.head().map(|a| a.to_string()),
-            })),
+            "ready": self.readiness().is_ok(),
+            "not_ready": self.not_ready(),
+            "witness": self.witness.as_ref().map(|w| {
+                let active = w.active();
+                let older = crate::witness::segments(w.path());
+                json!({
+                    "path": w.path().display().to_string(),
+                    "key_id": w.key_id(),
+                    "public_key": w.public_key(),
+                    "head": w.head().map(|a| a.to_string()),
+                    "ok": self.witness_ok.load(Ordering::Relaxed),
+                    "last_error": self.witness_error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                    "segment_bytes": active.bytes,
+                    "segment_entries": active.entries,
+                    "rotate_mb": rt.cfg.witness.rotate_mb,
+                    "segments": older.len(),
+                    "segments_bytes": older.iter().map(|s| s.bytes).sum::<u64>(),
+                })
+            }),
             "budget": {
                 "daily_tokens": rt.cfg.budget.daily_tokens,
                 "session_tokens": rt.cfg.budget.session_tokens,
                 "used_today": self.budgets.daily_usage().into_iter()
-                    .map(|(client, tokens)| json!({"client": client, "tokens": tokens}))
+                    .map(|(client, tokens)| json!({
+                        "limit": rt.cfg.daily_tokens_for(&client),
+                        "client": client,
+                        "tokens": tokens,
+                    }))
                     .collect::<Vec<_>>(),
             },
             "telemetry": self.telemetry.is_some(),
@@ -527,9 +818,10 @@ impl AppState {
                 Some(p) => p.status(),
                 None => json!({ "enabled": false, "state": "off" }),
             },
-            "ready": self.readiness().is_ok(),
             "clients": rt.cfg.clients.len(),
+            "admins": rt.cfg.admins.len(),
             "require_client": rt.cfg.server.require_client,
+            "control_listen": rt.cfg.control_listen(),
         })
     }
 }
@@ -557,7 +849,9 @@ pub fn reload(state: &AppState, path: &Path) -> Result<(), String> {
         {
             restart.push("telemetry");
         }
-        if cfg.control.token != old.cfg.control.token {
+        if cfg.control.token != old.cfg.control.token
+            || cfg.control.listen != old.cfg.control.listen
+        {
             restart.push("control");
         }
         if cfg.log.format != old.cfg.log.format || cfg.log.level != old.cfg.log.level {
@@ -674,23 +968,47 @@ pub fn spawn_presidio_supervisor(state: Arc<AppState>) -> tokio::task::JoinHandl
 /// Der komplette Router. Separat, damit Integrationstests ihn ohne
 /// echten Listener benutzen können.
 pub fn router(state: Arc<AppState>) -> Router {
+    with_proxy(with_control(probes())).with_state(state)
+}
+
+/// Nur der Proxy, ohne Steuer-API – für den Betrieb mit `control.listen`.
+/// `/_hedge/*` ist hier kein Upstream und wird mit 404 beantwortet.
+pub fn proxy_router(state: Arc<AppState>) -> Router {
+    with_proxy(probes()).with_state(state)
+}
+
+/// Nur die Steuer-API, für ihre eigene Adresse (`control.listen`).
+pub fn control_router(state: Arc<AppState>) -> Router {
+    with_control(probes()).with_state(state)
+}
+
+fn probes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/_hedge/status", get(control_status))
-        .route("/_hedge/approvals", get(control_approvals))
-        .route("/_hedge/approvals/{id}/{verdict}", post(control_resolve))
-        .route("/{upstream}/{*rest}", any(proxy))
-        .with_state(state)
 }
 
+fn with_control(r: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+    r.route("/_hedge/status", get(control_status))
+        .route("/_hedge/approvals", get(control_approvals))
+        .route("/_hedge/approvals/{id}/{verdict}", post(control_resolve))
+        .route("/_hedge/witness", get(control_witness))
+        .route("/_hedge/witness/rotate", post(control_rotate))
+}
+
+fn with_proxy(r: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+    r.route("/{upstream}/{*rest}", any(proxy))
+}
+
+/// Lebt der Prozess? Antwortet immer.
 async fn health() -> &'static str {
     "ok"
 }
 
 /// Bereitschaft für Orchestrierung und Load Balancer: 200, wenn Hedge
-/// Anfragen so bedient, wie die Config es verlangt; sonst 503 mit dem,
-/// worauf es wartet. `/health` sagt nur, dass der Prozess lebt.
+/// Anfragen so bedient, wie die Config es verlangt; sonst 503 mit den
+/// Gründen (Herunterfahren, Witness nicht schreibbar, Presidio fehlt).
+/// `/health` sagt nur, dass der Prozess lebt.
 async fn ready(State(state): State<Arc<AppState>>) -> Response {
     match state.readiness() {
         Ok(()) => Json(json!({ "ready": true })).into_response(),
@@ -727,6 +1045,8 @@ pub enum ProxyError {
 
     #[error("request held back by hedge: {reason}")]
     PresidioUnavailable { reason: String },
+    #[error("request rejected by hedge: {reason}")]
+    TooLarge { reason: String },
 }
 
 impl IntoResponse for ProxyError {
@@ -743,10 +1063,31 @@ impl IntoResponse for ProxyError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "hedge_presidio_unavailable",
             ),
+            Self::TooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, "hedge_request_too_large"),
         };
         // Fehler im Format der LLM-APIs, damit Agents wie Claude Code die
         // Begründung dem Nutzer anzeigen statt eines nackten HTTP-Fehlers.
-        error_response(status, kind, &self.to_string())
+        let mut resp = error_response(status, kind, &self.to_string());
+        // Hedges eigene Absagen ändern sich durch Wiederholen nicht. Die
+        // SDKs von Anthropic und OpenAI lesen diesen Header und geben auf,
+        // statt etwa ein erschöpftes Budget (429) minutenlang neu zu versuchen.
+        // Ein fehlendes Presidio ist vorübergehend; ob Agents darauf warten
+        // oder aufgeben sollen, ist noch nicht entschieden – es bleibt bei
+        // der nackten 503.
+        let policy = !matches!(
+            self,
+            Self::UnknownUpstream(_)
+                | Self::Body(_)
+                | Self::Upstream(_)
+                | Self::PresidioUnavailable { .. }
+        );
+        if policy {
+            resp.headers_mut().insert(
+                "x-should-retry",
+                axum::http::HeaderValue::from_static("false"),
+            );
+        }
+        resp
     }
 }
 
@@ -794,7 +1135,6 @@ pub async fn proxy(
 
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
-    let original = to_bytes(body, MAX_BODY_BYTES).await?;
 
     let mut rec = Record {
         upstream: upstream.clone(),
@@ -802,15 +1142,21 @@ pub async fn proxy(
         path: request_path,
         mode: rt.cfg.mode.as_str().to_owned(),
         action: Action::Forward.as_str().to_owned(),
-        body_sha256_in: sha256_hex(&original),
+        // Der Hash des Bodys folgt, sobald er gelesen ist. Wer vorher
+        // abgewiesen wird, hat keinen geliefert, den Hedge kennt.
+        body_sha256_in: sha256_hex(b""),
         ..Record::default()
     };
 
-    // Wer fragt? (Central-Mode)
-    rec.client = rt.client_of(&parts.headers);
+    // Wer fragt? (Central-Mode) Das klärt Hedge, bevor es den Body liest:
+    // Ohne gültiges Token soll niemand Speicher belegen können.
+    let who = rt.client_of(&parts.headers);
+    rec.client = who.as_ref().ok().cloned().flatten();
     let budget_key = rec.client.clone().unwrap_or_else(|| LOCAL.to_owned());
     if rt.cfg.server.require_client && rec.client.is_none() {
-        let reason = format!("missing or unknown client token (header {CLIENT_TOKEN_HEADER})");
+        let reason = who.err().unwrap_or_else(|| {
+            format!("missing or unknown client token (header {CLIENT_TOKEN_HEADER})")
+        });
         return Err(reject(
             &state,
             rec,
@@ -820,6 +1166,49 @@ pub async fn proxy(
             |reason| ProxyError::UnknownClient { reason },
         ));
     }
+
+    // Body lesen, höchstens bis zum Limit. Steht die Länge im Header, fällt
+    // die Entscheidung, ohne ein Byte zu lesen.
+    let limit = rt.cfg.server.max_body_bytes();
+    let announced = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let original = match announced {
+        Some(n) if n > limit => Err(Some(n)),
+        _ => match to_bytes(body, limit).await {
+            Ok(b) => Ok(b),
+            Err(e) if root_cause(&e).contains("length limit") => Err(None),
+            Err(e) => return Err(ProxyError::Body(e)),
+        },
+    };
+    let original = match original {
+        Ok(b) => b,
+        Err(size) => {
+            rec.session = session_from_headers(&parts.headers);
+            let reason = match size {
+                Some(n) => format!(
+                    "request body of {} MiB is larger than server.max_body_mb = {}",
+                    n.div_ceil(1024 * 1024),
+                    rt.cfg.server.max_body_mb
+                ),
+                None => format!(
+                    "request body is larger than server.max_body_mb = {}",
+                    rt.cfg.server.max_body_mb
+                ),
+            };
+            return Err(reject(
+                &state,
+                rec,
+                started,
+                &budget_key,
+                reason,
+                |reason| ProxyError::TooLarge { reason },
+            ));
+        }
+    };
+    rec.body_sha256_in = sha256_hex(&original);
 
     let prepared = Prepared::parse(original.clone());
     if let Ok(p) = &prepared {
@@ -863,10 +1252,11 @@ pub async fn proxy(
     }
 
     // Ist noch Budget da?
-    if let Err(reason) = state
-        .budgets
-        .check(&budget_key, rec.session.as_deref(), &rt.cfg.budget)
-    {
+    if let Err(reason) = state.budgets.check(
+        &budget_key,
+        rec.session.as_deref(),
+        &rt.budget_for(&budget_key),
+    ) {
         return Err(reject(
             &state,
             rec,
@@ -988,6 +1378,10 @@ pub async fn proxy(
         headers.remove(k);
     }
 
+    // Ab hier liegt der Prompt beim Upstream. Fährt Hedge herunter, bevor
+    // die Antwort endet, wird die Anfrage trotzdem bezeugt.
+    let in_flight = state.track(&rec, started, &budget_key);
+
     let upstream_resp = match rt
         .client
         .request(method, url)
@@ -1000,7 +1394,9 @@ pub async fn proxy(
         Err(e) => {
             rec.detail = Some(format!("upstream unreachable: {}", root_cause(&e)));
             rec.aborted = true;
-            state.complete(rec, started, &budget_key);
+            if in_flight.claim() {
+                state.complete(rec, started, &budget_key);
+            }
             return Err(ProxyError::Upstream(e));
         }
     };
@@ -1035,12 +1431,16 @@ pub async fn proxy(
             Err(e) => {
                 rec.detail = Some(format!("upstream response error: {}", root_cause(&e)));
                 rec.aborted = true;
-                state.complete(rec, started, &budget_key);
+                if in_flight.claim() {
+                    state.complete(rec, started, &budget_key);
+                }
                 return Err(ProxyError::Upstream(e));
             }
         };
         let bytes = analyze_json_response(&state, &rt, &mut rec, bytes).await;
-        state.complete(rec, started, &budget_key);
+        if in_flight.claim() {
+            state.complete(rec, started, &budget_key);
+        }
         let mut response = Response::new(Body::from(bytes));
         *response.status_mut() = status;
         *response.headers_mut() = resp_headers;
@@ -1060,6 +1460,7 @@ pub async fn proxy(
             started,
             budget_key,
             analyze: analyze && is_sse,
+            in_flight,
         },
     ));
 
@@ -1099,6 +1500,8 @@ struct Pump {
     started: Instant,
     budget_key: String,
     analyze: bool,
+    /// Hält die Anfrage in der Liste der laufenden, bis der Strom endet.
+    in_flight: InFlight,
 }
 
 type Tx = mpsc::Sender<Result<Bytes, std::io::Error>>;
@@ -1210,7 +1613,9 @@ async fn pump(resp: reqwest::Response, tx: Tx, mut p: Pump) {
         }
     }
     drop(tx);
-    p.state.complete(p.rec, p.started, &p.budget_key);
+    if p.in_flight.claim() {
+        p.state.complete(p.rec, p.started, &p.budget_key);
+    }
 }
 
 /// Wertet eine vollständige JSON-Antwort aus und schreibt sie um, falls
@@ -1835,42 +2240,50 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// `None` = berechtigt; sonst die fertige Fehlerantwort.
-fn denied(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let Some(expected) = &state.control_token else {
-        return Some(error_response(
+/// Wer die Steuer-API benutzt: das lokale Token oder ein benannter Admin.
+/// `Ok` trägt den Weg, wie er im Witness steht (`control api` oder
+/// `control api (anna)`); `Err` ist die fertige Fehlerantwort.
+fn admin(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Response>> {
+    let rt = state.runtime();
+    if state.control_token.is_none() && rt.admins.is_empty() {
+        return Err(Box::new(error_response(
             StatusCode::FORBIDDEN,
             "hedge_control_disabled",
-            "control API is disabled: no control token found (run `hedge init`, then restart hedge)",
-        ));
-    };
+            "control API is disabled: no control token found (run `hedge init`, then restart hedge) and no [[admins]] configured",
+        )));
+    }
     let given = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if constant_time_eq(given.trim().as_bytes(), expected.as_bytes()) {
-        None
-    } else {
-        Some(error_response(
+        .unwrap_or("")
+        .trim();
+    if let Some(expected) = &state.control_token
+        && constant_time_eq(given.as_bytes(), expected.as_bytes())
+    {
+        return Ok("control api".into());
+    }
+    match rt.admin_of(given) {
+        Some(name) => Ok(format!("control api ({name})")),
+        None => Err(Box::new(error_response(
             StatusCode::UNAUTHORIZED,
             "hedge_unauthorized",
             "missing or wrong control token",
-        ))
+        ))),
     }
 }
 
 async fn control_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match denied(&state, &headers) {
-        Some(r) => r,
-        None => Json(state.status()).into_response(),
+    match admin(&state, &headers) {
+        Err(r) => *r,
+        Ok(_) => Json(state.status()).into_response(),
     }
 }
 
 async fn control_approvals(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match denied(&state, &headers) {
-        Some(r) => r,
-        None => Json(state.approvals.list()).into_response(),
+    match admin(&state, &headers) {
+        Err(r) => *r,
+        Ok(_) => Json(state.approvals.list()).into_response(),
     }
 }
 
@@ -1879,9 +2292,10 @@ async fn control_resolve(
     UrlPath((id, verdict)): UrlPath<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(r) = denied(&state, &headers) {
-        return r;
-    }
+    let via = match admin(&state, &headers) {
+        Ok(via) => via,
+        Err(r) => return *r,
+    };
     let verdict = match verdict.as_str() {
         "approve" => Verdict::Approved,
         "deny" => Verdict::Rejected,
@@ -1893,7 +2307,7 @@ async fn control_resolve(
             );
         }
     };
-    match state.resolve_approval(&id, verdict, "control api", |_| true) {
+    match state.resolve_approval(&id, verdict, &via, |_| true) {
         Some(info) => Json(json!({ "resolved": info, "verdict": match verdict {
             Verdict::Approved => "approved",
             Verdict::Rejected => "rejected",
@@ -1904,6 +2318,88 @@ async fn control_resolve(
             "hedge_unknown_approval",
             &format!("no pending approval with id {id:?} (already decided or timed out?)"),
         ),
+    }
+}
+
+/// Welches Stück der Kette ein Leser haben will.
+#[derive(Debug, Default, serde::Deserialize)]
+struct WitnessQuery {
+    /// Einträge nach dieser Sequenznummer (Standard: 0 = von Anfang an).
+    after: Option<u64>,
+    /// Stattdessen: die letzten N Einträge.
+    last: Option<u64>,
+}
+
+/// Header der Antwort auf `/_hedge/witness`.
+pub const WITNESS_LAST_HEADER: &str = "x-hedge-witness-last";
+pub const WITNESS_HEAD_HEADER: &str = "x-hedge-witness-head";
+
+/// Liefert Witness-Einträge als JSONL, damit `hedge tail`, `sessions`,
+/// `report` und `watch` auch gegen einen entfernten Hedge funktionieren.
+/// Der Leser fragt mit `after=<letzte Sequenznummer>` weiter, bis
+/// `x-hedge-witness-last` den Kopf erreicht.
+async fn control_witness(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<WitnessQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = admin(&state, &headers) {
+        return *r;
+    }
+    let Some(w) = state.witness() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "hedge_witness_disabled",
+            "the witness is disabled ([witness] enabled = false)",
+        );
+    };
+    let after = match q.last {
+        Some(n) => w.head().map_or(0, |h| h.seq.saturating_sub(n)),
+        None => q.after.unwrap_or(0),
+    };
+    match w.read_after(after, WITNESS_CHUNK_BYTES) {
+        Ok(chunk) => (
+            [
+                (header::CONTENT_TYPE, "application/x-ndjson".to_owned()),
+                (
+                    header::HeaderName::from_static(WITNESS_LAST_HEADER),
+                    chunk.last.to_string(),
+                ),
+                (
+                    header::HeaderName::from_static(WITNESS_HEAD_HEADER),
+                    chunk.head.to_string(),
+                ),
+            ],
+            chunk.bytes,
+        )
+            .into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "hedge_witness_error",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// Legt das aktive Segment ab (`hedge rotate`).
+async fn control_rotate(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let via = match admin(&state, &headers) {
+        Ok(via) => via,
+        Err(r) => return *r,
+    };
+    match state.rotate_witness(&format!("requested via {via}")) {
+        Ok(segment) => Json(json!({
+            "rotated": segment.as_ref().map(|s| json!({
+                "file": s.path.file_name().and_then(|n| n.to_str()),
+                "path": s.path.display().to_string(),
+                "first": s.first,
+                "last": s.last,
+                "bytes": s.bytes,
+            })),
+            "head": state.witness().and_then(|w| w.head()).map(|a| a.to_string()),
+        }))
+        .into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "hedge_witness_error", &e),
     }
 }
 

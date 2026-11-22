@@ -9,7 +9,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider as _};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider as _, ObservableGauge};
 use opentelemetry::trace::{
     Span as _, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags, TraceId,
     TraceState, Tracer as _, TracerProvider as _,
@@ -38,6 +38,9 @@ pub struct Telemetry {
     presidio_unscanned: Counter<u64>,
     presidio_duration: Histogram<f64>,
     presidio_up: Gauge<u64>,
+    /// Herzschlag: Bleibt er aus, steht Hedge. Ohne ihn sähe ein Ausfall
+    /// in den Metriken aus wie ein ruhiger Nachmittag.
+    _up: ObservableGauge<u64>,
 }
 
 /// Führt `f` auf einem eigenen Thread aus. Der OTLP-Exporter benutzt einen
@@ -144,6 +147,11 @@ impl Telemetry {
                 .with_description(
                     "1 while Presidio is ready, 0 while it is starting or unavailable",
                 )
+                .build(),
+            _up: meter
+                .u64_observable_gauge("hedge_up")
+                .with_description("1 while hedge is running (heartbeat)")
+                .with_callback(|observer| observer.observe(1, &[]))
                 .build(),
             tracer,
             tracer_provider,

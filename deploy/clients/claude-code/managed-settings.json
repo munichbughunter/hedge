@@ -1,0 +1,6 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://hedge.example.com/anthropic"
+  },
+  "allowedProviders": ["customEndpoint"]
+}

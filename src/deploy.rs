@@ -17,6 +17,8 @@ const COMPOSE: &str = include_str!("../deploy/central/docker-compose.yml");
 const ENV: &str = include_str!("../deploy/central/env.template");
 const README: &str = include_str!("../deploy/central/README.md");
 const HEDGE_TOML: &str = include_str!("../deploy/central/hedge/hedge.toml");
+const CADDYFILE: &str = include_str!("../deploy/central/Caddyfile");
+const CERTS_README: &str = include_str!("../deploy/central/certs/README.md");
 const DASHBOARDS: &str = include_str!("../deploy/compose/grafana/hedge-dashboards.yaml");
 const DASHBOARD: &str = include_str!("../deploy/compose/grafana/dashboards/hedge.json");
 const ALERTS: &str = include_str!("../deploy/compose/grafana/alerting/hedge-alerts.yaml");
@@ -31,6 +33,8 @@ pub struct Options {
     pub clients: Vec<NewClient>,
     /// Grafana-Stack einschalten (Profil + Telemetrie).
     pub observability: bool,
+    /// Caddy für TLS davorschalten (Profil).
+    pub tls: bool,
 }
 
 /// Was `write` getan hat, Datei für Datei.
@@ -89,10 +93,11 @@ pub fn central_config(opts: &Options) -> String {
 /// Alle Dateien des Verzeichnisses: (Pfad relativ zum Ziel, Inhalt).
 pub fn files(opts: &Options) -> Vec<(PathBuf, String)> {
     let version = env!("CARGO_PKG_VERSION");
-    let profiles = if opts.observability {
-        "COMPOSE_PROFILES=observability"
-    } else {
-        "# COMPOSE_PROFILES=observability"
+    let profiles = match (opts.tls, opts.observability) {
+        (true, true) => "COMPOSE_PROFILES=tls,observability",
+        (true, false) => "COMPOSE_PROFILES=tls",
+        (false, true) => "COMPOSE_PROFILES=observability",
+        (false, false) => "# COMPOSE_PROFILES=tls,observability",
     };
     let mut out: Vec<(PathBuf, String)> = vec![
         (
@@ -105,6 +110,10 @@ pub fn files(opts: &Options) -> Vec<(PathBuf, String)> {
         ),
         ("README.md".into(), README.to_owned()),
         ("hedge/hedge.toml".into(), central_config(opts)),
+        // Liegen immer dabei, auch ohne das Profil: Einschalten ist dann
+        // eine Zeile in .env.
+        ("Caddyfile".into(), CADDYFILE.to_owned()),
+        ("certs/README.md".into(), CERTS_README.to_owned()),
         (
             "grafana/hedge-dashboards.yaml".into(),
             DASHBOARDS.to_owned(),
@@ -174,6 +183,10 @@ mod tests {
     use crate::config::{Mode, OnUnavailable};
 
     fn opts(clients: &[&str], observability: bool) -> Options {
+        opts_tls(clients, observability, false)
+    }
+
+    fn opts_tls(clients: &[&str], observability: bool, tls: bool) -> Options {
         Options {
             clients: clients
                 .iter()
@@ -183,6 +196,7 @@ mod tests {
                 })
                 .collect(),
             observability,
+            tls,
         }
     }
 
@@ -204,6 +218,12 @@ mod tests {
             "not before enforce is switched on"
         );
         assert_eq!(cfg.witness.path, "/var/lib/hedge/witness.jsonl");
+        assert_eq!(cfg.witness.rotate_mb, 64);
+        assert_eq!(
+            cfg.control_listen(),
+            Some("0.0.0.0:18766"),
+            "the control API is not on the agents' port"
+        );
     }
 
     #[test]
@@ -230,7 +250,7 @@ mod tests {
         let all = files(&opts(&[], false));
         let env = &all.iter().find(|(p, _)| p == Path::new(".env")).unwrap().1;
         assert!(env.contains(concat!("hedge-presidio:", env!("CARGO_PKG_VERSION"))));
-        assert!(env.contains("# COMPOSE_PROFILES=observability"));
+        assert!(env.contains("# COMPOSE_PROFILES=tls,observability"));
         let names: Vec<String> = all.iter().map(|(p, _)| p.display().to_string()).collect();
         for expected in [
             "docker-compose.yml",
@@ -239,6 +259,8 @@ mod tests {
             "presidio/analyzer.yaml",
             "presidio/server.py",
             "grafana/dashboards/hedge.json",
+            "Caddyfile",
+            "certs/README.md",
         ] {
             assert!(names.iter().any(|n| n == expected), "{expected} missing");
         }
@@ -257,6 +279,41 @@ mod tests {
         assert!(presidio.contains("networks: [guard]"));
         assert!(compose.contains("guard:\n    internal: true"));
         assert!(compose.contains("condition: service_healthy"));
+    }
+
+    #[test]
+    fn profiles_follow_the_options() {
+        let env = |observability, tls| {
+            let all = files(&opts_tls(&[], observability, tls));
+            all.into_iter()
+                .find(|(p, _)| p == Path::new(".env"))
+                .unwrap()
+                .1
+        };
+        assert!(env(false, true).contains("\nCOMPOSE_PROFILES=tls\n"));
+        assert!(env(true, false).contains("\nCOMPOSE_PROFILES=observability\n"));
+        assert!(env(true, true).contains("\nCOMPOSE_PROFILES=tls,observability\n"));
+    }
+
+    #[test]
+    fn caddy_is_optional_and_guards_the_control_api() {
+        let all = files(&opts(&[], false));
+        let compose = &all[0].1;
+        let caddy = compose.split("\n  caddy:").nth(1).unwrap();
+        let caddy = caddy.split("\n  presidio:").next().unwrap();
+        assert!(caddy.contains("profiles: [tls]"), "off unless asked for");
+        assert!(!caddy.contains("guard"), "caddy never reaches presidio");
+        let caddyfile = &all
+            .iter()
+            .find(|(p, _)| p == Path::new("Caddyfile"))
+            .unwrap()
+            .1;
+        assert!(caddyfile.contains("auto_https disable_redirects"));
+        assert!(caddyfile.contains("flush_interval -1"), "answers stream");
+        assert!(caddyfile.contains("reverse_proxy hedge:18766"));
+        assert!(caddyfile.contains("remote_ip {$HEDGE_ADMIN_CIDRS}"));
+        // Der Port der Agents bietet die Steuer-API nicht an.
+        assert!(compose.contains(":18766\""));
     }
 
     #[test]

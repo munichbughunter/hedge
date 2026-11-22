@@ -199,8 +199,10 @@ pub struct App {
     pub toast: Option<Toast>,
     /// Adresse der Steuer-API, für Hinweise.
     pub base: String,
-    /// Kein lokaler Witness: Hedge läuft woanders (`--url`).
+    /// Hedge läuft woanders (`--url`): Der Witness kommt über die Steuer-API.
     pub remote: bool,
+    /// Warum der entfernte Witness gerade nicht zu lesen ist.
+    pub remote_error: Option<String>,
     /// Regel-ID → Begründung in Worten (aus der Config).
     pub rules: BTreeMap<String, String>,
     known_approvals: Vec<String>,
@@ -228,6 +230,7 @@ impl App {
             toast: None,
             base,
             remote,
+            remote_error: None,
             rules: BTreeMap::new(),
             known_approvals: Vec::new(),
         }
@@ -683,6 +686,13 @@ enum Msg {
         approve: bool,
         result: std::result::Result<Value, String>,
     },
+    /// Witness-Einträge eines entfernten Hedge, gelesen über die Steuer-API.
+    Witness {
+        restarted: bool,
+        entries: Vec<Entry>,
+    },
+    /// Der entfernte Witness ließ sich nicht lesen.
+    WitnessError(String),
 }
 
 /// Einstieg für `hedge watch`.
@@ -694,8 +704,18 @@ pub async fn run(config_path: &Path, remote: Remote) -> Result<i32> {
     }
     let is_remote = remote.url.is_some();
     let mut rules = BTreeMap::new();
+    let mut remote_key = None;
     let (mut source, base, control) = if is_remote {
         let control = Control::new(config_path, remote)?;
+        // Der entfernte Hedge nennt seinen öffentlichen Schlüssel; damit
+        // prüft die Ansicht, dass die gelieferte Kette in sich stimmt.
+        if let Ok(status) = control.call(reqwest::Method::GET, "/_hedge/status").await {
+            remote_key = status["witness"]["public_key"]
+                .as_str()
+                .and_then(|k| hex::decode(k).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok());
+        }
         (None, control.base.clone(), Ok(Arc::new(control)))
     } else {
         let cfg = load_or_hint(config_path)?;
@@ -718,7 +738,7 @@ pub async fn run(config_path: &Path, remote: Remote) -> Result<i32> {
 
     let model = match &source {
         Some(s) => s.fresh_model(),
-        None => Model::new(None),
+        None => Model::new(remote_key),
     };
     let mut app = App::new(model, base, is_remote);
     app.rules = rules;
@@ -736,6 +756,10 @@ pub async fn run(config_path: &Path, remote: Remote) -> Result<i32> {
 
     let mut terminal = ratatui::init();
     let fetching = Arc::new(AtomicBool::new(false));
+    // Entfernter Witness: der Stand, bis zu dem gelesen ist. `None` heißt
+    // „noch nichts geholt“ – dann beginnt die Ansicht mit den letzten Einträgen.
+    let reading = Arc::new(AtomicBool::new(false));
+    let remote_at = Arc::new(std::sync::Mutex::new(None::<u64>));
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut ticks: u64 = 0;
     let outcome: Result<()> = loop {
@@ -760,6 +784,15 @@ pub async fn run(config_path: &Path, remote: Remote) -> Result<i32> {
                         bell();
                     }
                 }
+                Msg::Witness { restarted, entries } => {
+                    if restarted {
+                        app.model = Model::new(remote_key);
+                        app.cursor = 0;
+                    }
+                    app.remote_error = None;
+                    app.ingest(entries);
+                }
+                Msg::WitnessError(reason) => app.remote_error = Some(reason),
                 Msg::Resolved { approve, result } => {
                     match result {
                         Ok(v) => app.say(resolved_text(&v, approve), if approve { Tone::Ok } else { Tone::Bad }),
@@ -784,6 +817,9 @@ pub async fn run(config_path: &Path, remote: Remote) -> Result<i32> {
                     && let Ok(c) = &control
                 {
                     refresh(c.clone(), tx.clone(), fetching.clone());
+                    if is_remote {
+                        read_remote(c.clone(), tx.clone(), reading.clone(), remote_at.clone());
+                    }
                 }
                 ticks += 1;
             }
@@ -837,6 +873,54 @@ fn refresh(control: Arc<Control>, tx: UnboundedSender<Msg>, fetching: Arc<Atomic
         };
         fetching.store(false, Ordering::Relaxed);
         let _ = tx.send(Msg::Control { approvals, status });
+    });
+}
+
+/// So viele Einträge holt die Ansicht beim Start von einem entfernten Hedge.
+const REMOTE_HISTORY: u64 = 20_000;
+
+/// Holt neue Witness-Einträge über die Steuer-API. Nie zwei Abrufe zugleich.
+fn read_remote(
+    control: Arc<Control>,
+    tx: UnboundedSender<Msg>,
+    reading: Arc<AtomicBool>,
+    at: Arc<std::sync::Mutex<Option<u64>>>,
+) {
+    if reading.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tokio::spawn(async move {
+        let seen = *at.lock().unwrap_or_else(|e| e.into_inner());
+        let query = match seen {
+            Some(seq) => format!("after={seq}"),
+            None => format!("last={REMOTE_HISTORY}"),
+        };
+        let mut query = query;
+        let mut seen = seen;
+        // Bis zum Kopf der Kette weiterlesen – ein Abruf liefert höchstens
+        // einige Megabyte, der erste Stand kann mehrere brauchen.
+        loop {
+            let (entries, last, head) = match control.witness(&query).await {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    let _ = tx.send(Msg::WitnessError(e.to_string()));
+                    break;
+                }
+            };
+            // Der Stand fällt zurück: Dort läuft jetzt eine andere Kette.
+            let restarted = seen.is_some_and(|s| last < s);
+            let next = if restarted { None } else { Some(last) };
+            *at.lock().unwrap_or_else(|e| e.into_inner()) = next;
+            let more = !restarted && last < head && seen != next;
+            // Auch ein leeres Stück ist eine Nachricht: Der Witness ist lesbar.
+            let _ = tx.send(Msg::Witness { restarted, entries });
+            if !more {
+                break;
+            }
+            seen = next;
+            query = format!("after={last}");
+        }
+        reading.store(false, Ordering::Relaxed);
     });
 }
 

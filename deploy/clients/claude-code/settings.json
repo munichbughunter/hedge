@@ -1,0 +1,5 @@
+{
+  "env": {
+    "ANTHROPIC_CUSTOM_HEADERS": "x-hedge-client-token: hc_REPLACE_WITH_THE_DEVELOPERS_TOKEN"
+  }
+}

@@ -18,6 +18,8 @@ mode = "observe"
 [server]
 listen = "127.0.0.1:18765"
 # require_client = false   # Central-Mode: nur Anfragen mit Client-Token annehmen
+# max_body_mb = 10         # größere Anfragen lehnt Hedge mit 413 ab
+# shutdown_grace_secs = 30 # so lange dürfen Antworten beim Beenden noch zu Ende laufen (0 = ohne Frist)
 
 # Jeder Upstream ist unter /<name>/... erreichbar. Andere Ziele gibt es nicht.
 [[upstreams]]
@@ -102,10 +104,14 @@ url = "https://api.openai.com"
 # key  = "~/.hedge/witness.key"
 # tool_preview = true   # kurze, maskierte Vorschau jedes Tool-Aufrufs
 # hints = true          # maskierter Hinweis pro Fund: p…@example.com, …a1b2
+# rotate_mb = 0         # ab dieser Größe ein neues Segment beginnen (0 = nie);
+#                       # von Hand: hedge rotate. Die Kette läuft über Segmente weiter.
 
 # Steuer-API (hedge approve, hedge status). Das Token erzeugt `hedge init`.
 [control]
 # token = "~/.hedge/control.token"
+# listen = "127.0.0.1:18766"   # eigene Adresse nur für die Steuer-API; dann ist
+#                              # /_hedge/* auf dem Proxy-Port nicht mehr erreichbar
 
 # OpenTelemetry (OTLP/HTTP): Traces und Metriken nach Grafana & Co.
 # Stack zum Ausprobieren: deploy/compose/docker-compose.yml
@@ -142,4 +148,12 @@ url = "https://api.openai.com"
 # Central-Mode: bekannte Clients. Anlegen mit: hedge client add <name>
 # [[clients]]
 # name = "patrick"
+# token_sha256 = "…"
+# daily_tokens = 500000    # eigenes Tagesbudget statt [budget] daily_tokens
+# expires = "2027-01-31"   # letzter gültiger Tag (UTC)
+
+# Admins der Steuer-API. Anlegen mit: hedge admin add <name>
+# Jede Freigabe trägt den Namen im Witness; das lokale Token gilt weiter.
+# [[admins]]
+# name = "anna"
 # token_sha256 = "…"

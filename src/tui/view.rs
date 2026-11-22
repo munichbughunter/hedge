@@ -165,9 +165,7 @@ fn header(f: &mut Frame, area: Rect, app: &App, t: &Theme, now: DateTime<Local>)
         Link::Unknown => s("○ connecting", t.tone(Tone::Dim)),
     };
     let chain = &app.model.chain;
-    let chain = if app.remote {
-        s("CHAIN remote", t.tone(Tone::Dim))
-    } else if chain.unchecked {
+    let chain = if chain.unchecked {
         s("CHAIN ? no public key", t.tone(Tone::Warn))
     } else if chain.problems.is_empty() {
         s(
@@ -302,22 +300,31 @@ fn needs_you(f: &mut Frame, area: Rect, app: &App, t: &Theme) {
 // ---------- Übersicht ----------
 
 fn overview(f: &mut Frame, area: Rect, app: &App, t: &Theme, now: DateTime<Local>) {
-    if app.remote {
-        let text = vec![
+    // Ein entfernter Hedge, von dem (noch) nichts zu lesen ist: sagen, warum.
+    if app.remote && app.model.entries.is_empty() {
+        let mut text = vec![
             Line::from(""),
             Line::from(s(
                 format!("  Watching a remote hedge at {}.", app.base),
                 t.tone(Tone::Ink),
             )),
-            Line::from(s(
-                "  Sessions and the live stream are read from the witness file, which lives on that machine.",
-                t.tone(Tone::Muted),
-            )),
-            Line::from(s(
-                "  Approvals work from here: press 3.",
-                t.tone(Tone::Muted),
-            )),
         ];
+        match &app.remote_error {
+            Some(reason) => {
+                text.push(Line::from(s(
+                    format!("  Its witness cannot be read: {reason}"),
+                    t.tone(Tone::Warn),
+                )));
+                text.push(Line::from(s(
+                    "  Approvals still work from here: press 3.",
+                    t.tone(Tone::Muted),
+                )));
+            }
+            None => text.push(Line::from(s(
+                "  Reading its witness over the control API …",
+                t.tone(Tone::Muted),
+            ))),
+        }
         f.render_widget(Paragraph::new(text), area);
         return;
     }
@@ -758,12 +765,6 @@ fn rule_words(rule: &str, app: &App) -> String {
 // ---------- Live: Sessions, Band, Detail ----------
 
 fn live_tab(f: &mut Frame, area: Rect, app: &App, t: &Theme, now: DateTime<Local>) {
-    if app.remote {
-        let text =
-            " the tape needs the witness file – run `hedge watch` on the machine hedge runs on";
-        f.render_widget(Paragraph::new(text).style(t.tone(Tone::Dim)), area);
-        return;
-    }
     let focus = app.focus.as_deref().and_then(|id| app.model.session(id));
     let [top, main] = Layout::vertical([
         Constraint::Length(if focus.is_some() { 3 } else { 0 }),

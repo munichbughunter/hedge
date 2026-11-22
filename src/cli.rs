@@ -72,9 +72,10 @@ pub enum Command {
         /// Vorhandene hedge.toml überschreiben (Schlüssel werden nie überschrieben)
         #[arg(long)]
         force: bool,
-        /// Nur Signierschlüssel und Steuer-Token anlegen, keine hedge.toml
-        /// (für Container, in denen die Config von außen kommt)
-        #[arg(long)]
+        /// Nur Signierschlüssel und Steuer-Token anlegen, falls sie fehlen,
+        /// keine hedge.toml: an den Pfaden der Config, mit --dir in diesem
+        /// Verzeichnis (für Container und systemd)
+        #[arg(long, conflicts_with_all = ["claude_code", "force"])]
         keys_only: bool,
     },
     /// Config lesen, validieren und zusammenfassen
@@ -87,6 +88,13 @@ pub enum Command {
         remote: Remote,
         #[arg(long)]
         json: bool,
+    },
+    /// Bereitschaft prüfen (für Healthchecks): Exit-Code 0, wenn Hedge
+    /// Anfragen so bedient, wie die Config es verlangt, sonst 1 mit dem Grund
+    Ready {
+        /// Adresse eines laufenden Hedge (Standard: server.listen aus der Config)
+        #[arg(long, env = "HEDGE_URL")]
+        url: Option<String>,
     },
     /// Letzte Einträge des Witness lesbar anzeigen
     Tail {
@@ -108,6 +116,8 @@ pub enum Command {
         /// Rohe JSON-Zeilen statt Tabelle
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        remote: Remote,
     },
     /// Live-Ansicht im Terminal: Sessions, Freigaben per Taste, Live-Strom
     Watch {
@@ -121,6 +131,8 @@ pub enum Command {
         since: Option<String>,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        remote: Remote,
     },
     /// Zusammenfassung über alle Anfragen (für Admins)
     Report {
@@ -130,6 +142,8 @@ pub enum Command {
         /// Als JSON ausgeben
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        remote: Remote,
     },
     /// Angehaltene Tool-Aufrufe anzeigen, die auf Freigabe warten
     Approvals {
@@ -175,6 +189,11 @@ pub enum Command {
     },
     /// Aktuellen Kopf der Kette als Anker ausgeben (zum externen Aufbewahren)
     Head,
+    /// Aktives Witness-Segment ablegen und ein neues beginnen (Kette läuft weiter)
+    Rotate {
+        #[command(flatten)]
+        remote: Remote,
+    },
     /// Einen prüfbaren Auszug der Kette exportieren
     Export {
         /// Alle Einträge einer Session (Präfix genügt)
@@ -202,12 +221,10 @@ pub enum Command {
         #[command(subcommand)]
         command: DeployCommand,
     },
-    /// Bereitschaft prüfen (für Healthchecks): Exit-Code 0, wenn Hedge
-    /// Anfragen so bedient, wie die Config es verlangt
-    Ready {
-        /// Adresse eines laufenden Hedge (Standard: aus der Config)
-        #[arg(long, env = "HEDGE_URL")]
-        url: Option<String>,
+    /// Admins der Steuer-API verwalten (Freigaben tragen ihren Namen)
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
     },
 }
 
@@ -281,6 +298,9 @@ pub enum DeployCommand {
         /// Grafana mit Dashboard und Alerts einschalten
         #[arg(long)]
         observability: bool,
+        /// Caddy für TLS davorschalten (Zertifikat und Name stehen in .env)
+        #[arg(long)]
+        tls: bool,
         /// Vorhandenes Verzeichnis auffrischen (hedge.toml und .env bleiben)
         #[arg(long)]
         force: bool,
@@ -301,9 +321,52 @@ pub enum RulesCommand {
 #[derive(Subcommand, Debug)]
 pub enum ClientCommand {
     /// Neuen Client anlegen: erzeugt ein Token und trägt den Hash in die Config ein
-    Add { name: String },
+    Add {
+        name: String,
+        /// Config nicht anfassen, nur Token und TOML-Block ausgeben
+        /// (für Configs, die aus Git oder einer ConfigMap kommen)
+        #[arg(long)]
+        print: bool,
+        /// Letzter gültiger Tag, JJJJ-MM-TT (UTC)
+        #[arg(long)]
+        expires: Option<String>,
+        /// Eigenes Tagesbudget in Tokens statt [budget] daily_tokens
+        #[arg(long)]
+        daily_tokens: Option<u64>,
+    },
     /// Bekannte Clients auflisten
     List,
+    /// Client entfernen; sein Token gilt sofort nicht mehr
+    Remove { name: String },
+    /// Neues Token für einen Client; das alte gilt sofort nicht mehr
+    Rotate {
+        name: String,
+        /// Config nicht anfassen, nur Token und Hash ausgeben
+        #[arg(long)]
+        print: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminCommand {
+    /// Neuen Admin anlegen: erzeugt ein Token und trägt den Hash in die Config ein
+    Add {
+        name: String,
+        /// Config nicht anfassen, nur Token und TOML-Block ausgeben
+        #[arg(long)]
+        print: bool,
+    },
+    /// Bekannte Admins auflisten
+    List,
+    /// Admin entfernen; sein Token gilt sofort nicht mehr
+    Remove { name: String },
+    /// Neues Token für einen Admin; das alte gilt sofort nicht mehr
+    Rotate {
+        name: String,
+        /// Config nicht anfassen, nur Token und Hash ausgeben
+        #[arg(long)]
+        print: bool,
+    },
 }
 
 /// Führt das Kommando aus und liefert den Exit-Code.
@@ -312,17 +375,19 @@ pub async fn run(cli: Cli) -> Result<i32> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => cmd_run(&config_path).await,
         Command::Init {
+            keys_only: true,
+            dir,
+            ..
+        } => cmd_init_keys(&config_path, dir),
+        Command::Init {
             dir,
             claude_code,
             force,
-            keys_only,
-        } => {
-            if keys_only {
-                cmd_init_keys(dir)
-            } else {
-                cmd_init(dir, claude_code, force, &config_path)
-            }
-        }
+            keys_only: false,
+        } => cmd_init(dir, claude_code, force, &config_path),
+        Command::Ready { url } => cmd_ready(&config_path, url).await,
+        Command::Rotate { remote } => cmd_rotate(&config_path, remote).await,
+        Command::Admin { command } => cmd_admin(&config_path, command),
         Command::Check => cmd_check(&config_path),
         Command::Doctor => cmd_doctor(&config_path).await,
         Command::Status { remote, json } => cmd_status(&config_path, remote, json).await,
@@ -333,6 +398,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
             alerts,
             verbose,
             json,
+            remote,
         } => {
             let view = TailView {
                 session,
@@ -340,11 +406,19 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 verbose,
                 json,
             };
-            cmd_tail(&config_path, lines, follow, view).await
+            cmd_tail(&config_path, lines, follow, view, remote).await
         }
         Command::Watch { remote } => crate::tui::run(&config_path, remote).await,
-        Command::Sessions { since, json } => cmd_sessions(&config_path, since, json),
-        Command::Report { since, json } => cmd_report(&config_path, since, json),
+        Command::Sessions {
+            since,
+            json,
+            remote,
+        } => cmd_sessions(&config_path, since, json, remote).await,
+        Command::Report {
+            since,
+            json,
+            remote,
+        } => cmd_report(&config_path, since, json, remote).await,
         Command::Approvals { remote, json } => cmd_approvals(&config_path, remote, json).await,
         Command::Approve { id, remote } => cmd_resolve(&config_path, remote, &id, true).await,
         Command::Deny { id, remote } => cmd_resolve(&config_path, remote, &id, false).await,
@@ -399,10 +473,10 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 output,
                 clients,
                 observability,
+                tls,
                 force,
-            } => cmd_deploy_compose(&output, clients, observability, force),
+            } => cmd_deploy_compose(&output, clients, observability, tls, force),
         },
-        Command::Ready { url } => cmd_ready(&config_path, url).await,
     }
 }
 
@@ -412,10 +486,22 @@ async fn cmd_run(config_path: &Path) -> Result<i32> {
     let cfg = load_or_hint(config_path)?;
     init_tracing(&cfg);
 
-    let listener = tokio::net::TcpListener::bind(&cfg.server.listen)
-        .await
-        .map_err(|e| format!("cannot listen on {}: {e}", cfg.server.listen))?;
+    let bind = |addr: String| async move {
+        tokio::net::TcpListener::bind(&addr)
+            .await
+            .map_err(|e| format!("cannot listen on {addr}: {e}"))
+    };
+    let listener = bind(cfg.server.listen.clone()).await?;
     let addr = listener.local_addr()?;
+    // Die Steuer-API bekommt ihre eigene Adresse, wenn die Config es will.
+    let control = match cfg.control_listen() {
+        Some(a) => Some(bind(a.to_owned()).await?),
+        None => None,
+    };
+    let control_addr = match &control {
+        Some(l) => Some(l.local_addr()?),
+        None => None,
+    };
     let pretty = cfg.log.format == LogFormat::Pretty;
     let state = Arc::new(AppState::from_config(cfg)?);
 
@@ -443,19 +529,83 @@ async fn cmd_run(config_path: &Path) -> Result<i32> {
     }
 
     if pretty {
-        print_banner(&state, &addr, config_path);
+        print_banner(&state, &addr, control_addr.as_ref(), config_path);
     }
     tracing::info!(listen = %addr, mode = rt.cfg.mode.as_str(), config = %config_path.display(), "hedge started");
+    if let Some(c) = &control_addr {
+        tracing::info!(listen = %c, "control API on its own address");
+    }
     drop(rt);
 
     let reloader = proxy::spawn_reloader(state.clone(), config_path.to_path_buf());
-    axum::serve(listener, router(state.clone()))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+
+    // Ein Signal, zwei Folgen: Beide Listener nehmen nichts Neues mehr an,
+    // und die Frist für laufende Antworten beginnt.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            state.set_draining();
+            let _ = stop_tx.send(true);
+        });
+    }
+    let stopped = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = rx.wait_for(|stop| *stop).await;
+    };
+
+    let app = match control {
+        Some(_) => proxy::proxy_router(state.clone()),
+        None => router(state.clone()),
+    };
+    let serve_proxy = {
+        let stop = stopped(stop_rx.clone());
+        async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(stop)
+                .await
+        }
+    };
+    let serve_control = {
+        let stop = stopped(stop_rx.clone());
+        let app = proxy::control_router(state.clone());
+        async move {
+            match control {
+                Some(l) => axum::serve(l, app).with_graceful_shutdown(stop).await,
+                None => Ok(()),
+            }
+        }
+    };
+    let deadline = {
+        let state = state.clone();
+        let stop = stopped(stop_rx.clone());
+        async move {
+            stop.await;
+            match state.runtime().cfg.server.shutdown_grace_secs {
+                0 => std::future::pending::<u64>().await,
+                secs => {
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    secs
+                }
+            }
+        }
+    };
+    let how = tokio::select! {
+        served = async { tokio::try_join!(serve_proxy, serve_control) } => {
+            served?;
+            "graceful shutdown".to_owned()
+        }
+        secs = deadline => {
+            // Was jetzt noch läuft, wird nicht mehr fertig – aber bezeugt.
+            let cut = state.witness_cut_off();
+            tracing::warn!("shutdown grace period of {secs}s is over; {cut} running response(s) cut off");
+            format!("shutdown after {secs}s grace period, {cut} running response(s) cut off")
+        }
+    };
     reloader.abort();
     supervisor.abort();
 
-    state.record_event("stop", "graceful shutdown".into());
+    state.record_event("stop", how);
     if let Some(t) = state.telemetry() {
         t.flush();
     }
@@ -475,7 +625,12 @@ fn init_tracing(cfg: &Config) {
     }
 }
 
-fn print_banner(state: &AppState, addr: &std::net::SocketAddr, config_path: &Path) {
+fn print_banner(
+    state: &AppState,
+    addr: &std::net::SocketAddr,
+    control: Option<&std::net::SocketAddr>,
+    config_path: &Path,
+) {
     let rt = state.runtime();
     let cfg = &rt.cfg;
     let upstreams = cfg
@@ -508,6 +663,12 @@ fn print_banner(state: &AppState, addr: &std::net::SocketAddr, config_path: &Pat
         "(reloads on change)".dimmed()
     );
     println!("  listening   http://{addr}");
+    if let Some(c) = control {
+        println!(
+            "  control     http://{c}  {}",
+            "(status, approvals, witness – not on the proxy port)".dimmed()
+        );
+    }
     println!("  upstreams   {upstreams}");
     println!("  detectors   {}", detector_list(cfg));
     println!("  tools       {}", tools_line(cfg, &rt.tools));
@@ -764,92 +925,22 @@ fn cmd_init(dir: Option<PathBuf>, claude_code: bool, force: bool, effective: &Pa
     Ok(0)
 }
 
-/// Nur Signierschlüssel und Steuer-Token, keine Config. Für Container:
-/// Die Config kommt dort von außen, die Geheimnisse entstehen im Volume.
-/// Still, wenn schon alles da ist.
-fn cmd_init_keys(dir: Option<PathBuf>) -> Result<i32> {
-    let dir = dir.unwrap_or_else(config::default_dir);
-    std::fs::create_dir_all(&dir)?;
-    let key_path = dir.join("witness.key");
-    let token_path = dir.join("control.token");
-    if !key_path.exists() {
-        let vk = witness::generate_keypair(&key_path)?;
-        println!(
-            "created signing key {} (key id {})",
-            key_path.display(),
-            witness::key_id_of(&vk)
-        );
-    }
-    if !token_path.exists() {
-        witness::write_private(&token_path, random_hex(32)?.as_bytes())?;
-        println!("created control token {}", token_path.display());
-    }
-    Ok(0)
-}
-
-// ---------- ready ----------
-
-/// Fragt `/ready` eines laufenden Hedge. Braucht kein Token und eignet sich
-/// damit als Healthcheck eines Containers.
-async fn cmd_ready(config_path: &Path, url: Option<String>) -> Result<i32> {
-    let base = match url {
-        Some(u) => u.trim_end_matches('/').to_owned(),
-        None => {
-            let cfg = load_or_hint(config_path)?;
-            // Lauscht Hedge auf allen Adressen, ist es über Loopback erreichbar.
-            match cfg.server.listen.parse::<std::net::SocketAddr>() {
-                Ok(a) if a.ip().is_unspecified() => format!("http://127.0.0.1:{}", a.port()),
-                _ => format!("http://{}", cfg.server.listen),
-            }
-        }
-    };
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(4))
-        .build()?;
-    match http.get(format!("{base}/ready")).send().await {
-        Ok(r) if r.status().is_success() => {
-            println!("ready");
-            Ok(0)
-        }
-        Ok(r) if r.status().as_u16() == 503 => {
-            let body: Value = r.json().await.unwrap_or(Value::Null);
-            let waiting: Vec<&str> = body["waiting_for"]
-                .as_array()
-                .map(|a| a.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
-            println!("not ready: waiting for {}", waiting.join(", "));
-            Ok(1)
-        }
-        Ok(r) => {
-            println!(
-                "not ready: {base}/ready answered HTTP {} (is that a hedge of this version?)",
-                r.status().as_u16()
-            );
-            Ok(1)
-        }
-        Err(e) => {
-            println!(
-                "not ready: cannot reach hedge at {base} ({})",
-                short_err(&e)
-            );
-            Ok(1)
-        }
-    }
-}
-
 // ---------- deploy ----------
 
 fn cmd_deploy_compose(
     dir: &Path,
     clients: Vec<String>,
     observability: bool,
+    tls: bool,
     force: bool,
 ) -> Result<i32> {
     let mut tokens: Vec<(String, String)> = Vec::new();
     let mut new_clients = Vec::new();
     for name in clients {
-        if name.trim().is_empty() || name.contains(['"', '\n', '\\']) {
-            return Err("client name must be a simple, non-empty string".into());
+        if !config::valid_name(&name) {
+            return Err(
+                "client name must be 1–64 characters of a-z, A-Z, 0-9, '-', '_', '.', '@'".into(),
+            );
         }
         if tokens.iter().any(|(n, _)| *n == name) {
             return Err(format!("client {name:?} is named twice").into());
@@ -864,6 +955,7 @@ fn cmd_deploy_compose(
     let opts = crate::deploy::Options {
         clients: new_clients,
         observability,
+        tls,
     };
     crate::deploy::validate_central(&crate::deploy::central_config(&opts))
         .map_err(|e| format!("the generated config is not valid (this is a bug in hedge): {e}"))?;
@@ -885,10 +977,14 @@ fn cmd_deploy_compose(
     };
     line(
         "docker-compose.yml",
-        "hedge + presidio, grafana as a profile",
+        "hedge + presidio; caddy (tls) and grafana as profiles",
         false,
     );
-    line(".env", "image names, port, presidio workers", kept(".env"));
+    line(
+        ".env",
+        "image names, ports, profiles, presidio workers",
+        kept(".env"),
+    );
     line(
         "hedge/hedge.toml",
         "the central policy, reloaded on change",
@@ -900,6 +996,15 @@ fn cmd_deploy_compose(
         false,
     );
     line("grafana/", "dashboard and alert rules", false);
+    line(
+        "Caddyfile, certs/",
+        if tls {
+            "TLS in front of hedge (profile tls is on)"
+        } else {
+            "TLS in front of hedge, off until COMPOSE_PROFILES=tls"
+        },
+        false,
+    );
     line("README.md", "the steps, in order", false);
 
     if kept("hedge.toml") && !tokens.is_empty() {
@@ -930,25 +1035,39 @@ fn cmd_deploy_compose(
 
     println!();
     println!("  {}", "Next:".bold());
-    println!("    1. {}", format!("cd {}", dir.display()).cyan());
-    println!(
-        "    2. {}   until the images are published",
-        pad("docker compose build presidio", 32).cyan()
+    let mut n = 0;
+    let mut step = |what: String, note: &str| {
+        n += 1;
+        println!("    {n}. {}   {note}", pad(&what, 32).cyan());
+    };
+    step(format!("cd {}", dir.display()), "");
+    step(
+        "docker compose build presidio".into(),
+        "until the images are published",
     );
     println!("       {}   (the hedge image: see README.md)", pad("", 32));
-    println!("    3. {}", "docker compose up -d".cyan());
-    println!(
-        "    4. {}   answers {{\"ready\":true}} once presidio is up",
-        pad("curl -s 127.0.0.1:18765/ready", 32).cyan()
+    if tls && !kept(".env") {
+        step(
+            "edit .env".into(),
+            "HEDGE_DOMAIN, HEDGE_TLS and HEDGE_ADMIN_CIDRS for caddy",
+        );
+    }
+    step("docker compose up -d".into(), "");
+    step(
+        "curl -s 127.0.0.1:18765/ready".into(),
+        "answers {\"ready\":true} once presidio is up",
+    );
+    step(
+        "hedge status --url http://127.0.0.1:18766".into(),
+        "the control API has its own port",
     );
     if tokens.is_empty() && !kept("hedge.toml") {
-        println!(
-            "    5. {}",
+        step(
             format!(
                 "hedge --config {} client add <name>",
                 dir.join("hedge/hedge.toml").display()
-            )
-            .cyan()
+            ),
+            "",
         );
         println!("       then set server.require_client = true");
     }
@@ -1153,9 +1272,15 @@ fn print_config_summary(cfg: &Config) {
         );
     }
     println!(
-        "  timeouts    connect {}s, idle {}s",
-        cfg.timeouts.connect_secs, cfg.timeouts.request_secs
+        "  timeouts    connect {}s, idle {}s, shutdown grace {}",
+        cfg.timeouts.connect_secs,
+        cfg.timeouts.request_secs,
+        match cfg.server.shutdown_grace_secs {
+            0 => "unlimited".to_owned(),
+            s => format!("{s}s"),
+        }
     );
+    println!("  body limit  {} MiB", cfg.server.max_body_mb);
     println!(
         "  log         {} / {}",
         match cfg.log.format {
@@ -1175,6 +1300,14 @@ fn print_config_summary(cfg: &Config) {
             cfg.witness_path().display(),
             cfg.witness_key_path().display()
         );
+        println!(
+            "              {}",
+            match cfg.witness.rotate_mb {
+                0 => "one file, never rotated (witness.rotate_mb = 0)".to_owned(),
+                mb => format!("a new segment every {mb} MiB"),
+            }
+            .dimmed()
+        );
     } else {
         println!("  witness     {}", "disabled".yellow());
     }
@@ -1186,6 +1319,23 @@ fn print_config_summary(cfg: &Config) {
     println!(
         "  control     {} {token_state}",
         cfg.control_token_path().display()
+    );
+    let admins: Vec<&str> = cfg.admins.iter().map(|a| a.name.as_str()).collect();
+    println!(
+        "              {}",
+        format!(
+            "{}; {}",
+            match cfg.control_listen() {
+                Some(addr) => format!("on its own address {addr}"),
+                None => "on the proxy port".to_owned(),
+            },
+            if admins.is_empty() {
+                "no named admins".to_owned()
+            } else {
+                format!("admins: {}", admins.join(", "))
+            }
+        )
+        .dimmed()
     );
     if cfg.telemetry.enabled {
         println!(
@@ -1338,7 +1488,8 @@ fn cmd_verify(
                 .or_else(|| cfg.as_ref().map(|c| c.witness_key_path()))
                 .ok_or("no key path: pass --key or provide a config")?;
             let vk = witness::load_verifying_key(&key)?;
-            let entries = witness::read_entries(&witness_path)?;
+            // Abgelegte Segmente gehören zur Kette und werden mitgeprüft.
+            let entries = witness::read_chain(&witness_path)?;
             (witness_path, entries, vk, true)
         }
     };
@@ -1418,7 +1569,7 @@ fn print_verify_report(path: &Path, report: &VerifyReport, pinned: bool, anchore
 
 fn cmd_head(config_path: &Path) -> Result<i32> {
     let cfg = load_or_hint(config_path)?;
-    let entries = witness::read_entries(&cfg.witness_path())?;
+    let entries = witness::read_back(&cfg.witness_path(), |e| !e.is_empty())?;
     match entries.last() {
         Some(e) => {
             println!("{}:{}", e.seq, e.hash);
@@ -1438,7 +1589,7 @@ fn cmd_export(
     output: &Path,
 ) -> Result<i32> {
     let cfg = load_or_hint(config_path)?;
-    let entries = witness::read_entries(&cfg.witness_path())?;
+    let entries = witness::read_chain(&cfg.witness_path())?;
     let vk = witness::load_verifying_key(&cfg.witness_key_path())?;
     let head = entries.last().map(|e| Anchor {
         seq: e.seq,
@@ -1498,7 +1649,16 @@ impl TailView {
     }
 }
 
-async fn cmd_tail(config_path: &Path, lines: usize, follow: bool, view: TailView) -> Result<i32> {
+async fn cmd_tail(
+    config_path: &Path,
+    lines: usize,
+    follow: bool,
+    view: TailView,
+    remote: Remote,
+) -> Result<i32> {
+    if remote.url.is_some() {
+        return tail_remote(config_path, lines, follow, view, remote).await;
+    }
     let cfg = load_or_hint(config_path)?;
     let path = cfg.witness_path();
     if !path.exists() {
@@ -1512,7 +1672,19 @@ async fn cmd_tail(config_path: &Path, lines: usize, follow: bool, view: TailView
         }
     }
 
-    let (entries, mut offset) = witness::read_entries_from(&path, 0).unwrap_or_default();
+    let mut follower = witness::Follower::new(&path);
+    let (_, mut entries) = follower.poll();
+    // Reicht das aktive Segment nicht für die gewünschten Zeilen, kommen
+    // die abgelegten davor dazu.
+    for seg in witness::segments(&path).iter().rev() {
+        if entries.iter().filter(|e| view.wants(e)).count() >= lines {
+            break;
+        }
+        if let Ok(mut older) = witness::read_entries(&seg.path) {
+            older.append(&mut entries);
+            entries = older;
+        }
+    }
     let shown: Vec<&Entry> = entries.iter().filter(|e| view.wants(e)).collect();
     for e in &shown[shown.len().saturating_sub(lines)..] {
         print_entry(e, &view);
@@ -1526,16 +1698,57 @@ async fn cmd_tail(config_path: &Path, lines: usize, follow: bool, view: TailView
             _ = tokio::signal::ctrl_c() => break,
             _ = tokio::time::sleep(Duration::from_millis(400)) => {}
         }
-        if let Ok((new, next)) = witness::read_entries_from(&path, offset) {
-            offset = next;
-            for e in new.iter().filter(|e| view.wants(e)) {
-                print_entry(e, &view);
-                // Wartet etwas auf einen Menschen, soll er es auch hören.
-                if bell && severity_of(e) == Level::Hold {
-                    print!("\x07");
-                    let _ = std::io::stdout().flush();
-                }
-            }
+        let (_, new) = follower.poll();
+        print_new(&new, &view, bell);
+    }
+    Ok(0)
+}
+
+/// Zeigt neu angekommene Einträge; was auf einen Menschen wartet, klingelt.
+fn print_new(new: &[Entry], view: &TailView, bell: bool) {
+    for e in new.iter().filter(|e| view.wants(e)) {
+        print_entry(e, view);
+        if bell && severity_of(e) == Level::Hold {
+            print!("\x07");
+            let _ = std::io::stdout().flush();
+        }
+    }
+}
+
+/// `hedge tail --url …`: dieselbe Ansicht, gelesen über die Steuer-API.
+async fn tail_remote(
+    config_path: &Path,
+    lines: usize,
+    follow: bool,
+    view: TailView,
+    remote: Remote,
+) -> Result<i32> {
+    let control = Control::new(config_path, remote)?;
+    // Mit Filtern braucht es mehr Einträge, um `lines` passende zu finden.
+    let window = (lines as u64).saturating_mul(50).clamp(2_000, 50_000);
+    // Bis zum Kopf lesen: Das Fenster kann über mehrere Segmente reichen.
+    let entries = control
+        .witness_until_head(&format!("last={window}"))
+        .await?;
+    let mut last = entries.last().map_or(0, |e| e.seq);
+    let shown: Vec<&Entry> = entries.iter().filter(|e| view.wants(e)).collect();
+    for e in &shown[shown.len().saturating_sub(lines)..] {
+        print_entry(e, &view);
+    }
+    if !follow {
+        return Ok(0);
+    }
+    let bell = !view.json && std::io::stdout().is_terminal();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        // Ein Aussetzer der Verbindung beendet das Zuschauen nicht.
+        if let Ok((new, l, _)) = control.witness(&format!("after={last}")).await {
+            // Kleiner als zuvor: Dort läuft jetzt eine andere Kette.
+            last = l;
+            print_new(&new, &view, bell);
         }
     }
     Ok(0)
@@ -1580,7 +1793,10 @@ pub(crate) fn severity_of(e: &Entry) -> Level {
             .any(|t| t.rule.is_some() && t.decision != "allow")
         || matches!(
             e.event.as_deref(),
-            Some("config_reload_failed") | Some("approval") | Some("presidio_unavailable")
+            Some("config_reload_failed")
+                | Some("approval")
+                | Some("presidio_unavailable")
+                | Some("recovered")
         )
     {
         Level::Flag
@@ -1640,10 +1856,10 @@ fn print_entry(e: &Entry, view: &TailView) {
                 detail.dimmed()
             ),
             _ => {
-                let label = if event == "config_reload_failed" {
-                    pad("CONFIG", 7).red().bold().to_string()
-                } else {
-                    pad("·", 7).dimmed().to_string()
+                let label = match event.as_str() {
+                    "config_reload_failed" => pad("CONFIG", 7).red().bold().to_string(),
+                    "recovered" => pad("WITNESS", 7).yellow().bold().to_string(),
+                    _ => pad("·", 7).dimmed().to_string(),
                 };
                 println!("{time}  {label}  {}  {}", event.bold(), detail.dimmed());
             }
@@ -1938,9 +2154,13 @@ fn select_since<'a>(entries: &'a [Entry], since: &Option<String>) -> Result<Vec<
         .collect())
 }
 
-fn cmd_sessions(config_path: &Path, since: Option<String>, json: bool) -> Result<i32> {
-    let cfg = load_or_hint(config_path)?;
-    let entries = witness::read_entries(&cfg.witness_path()).unwrap_or_default();
+async fn cmd_sessions(
+    config_path: &Path,
+    since: Option<String>,
+    json: bool,
+    remote: Remote,
+) -> Result<i32> {
+    let entries = load_chain(config_path, remote).await?;
     let selected = select_since(&entries, &since)?;
 
     let mut rows: Vec<SessionRow> = Vec::new();
@@ -2055,10 +2275,20 @@ fn cmd_sessions(config_path: &Path, since: Option<String>, json: bool) -> Result
 
 // ---------- report ----------
 
-fn cmd_report(config_path: &Path, since: Option<String>, json: bool) -> Result<i32> {
-    let cfg = load_or_hint(config_path)?;
-    let path = cfg.witness_path();
-    let entries = witness::read_entries(&path).unwrap_or_default();
+async fn cmd_report(
+    config_path: &Path,
+    since: Option<String>,
+    json: bool,
+    remote: Remote,
+) -> Result<i32> {
+    let source = match &remote.url {
+        Some(url) => format!("{} (via control API)", url.trim_end_matches('/')),
+        None => load_or_hint(config_path)?
+            .witness_path()
+            .display()
+            .to_string(),
+    };
+    let entries = load_chain(config_path, remote).await?;
     let selected = select_since(&entries, &since)?;
 
     let summary = Summary::from(&selected);
@@ -2077,7 +2307,7 @@ fn cmd_report(config_path: &Path, since: Option<String>, json: bool) -> Result<i
         }
         .dimmed()
     );
-    println!("  witness   {}", path.display());
+    println!("  witness   {source}");
     if let (Some(f), Some(l)) = (&summary.first_ts, &summary.last_ts) {
         println!("  range     {}  →  {}", human_ts(f), human_ts(l));
     }
@@ -2417,25 +2647,48 @@ pub(crate) struct Control {
     http: reqwest::Client,
 }
 
+/// Ein HTTP-Client für Hedge selbst. Zu einer Adresse auf demselben Rechner
+/// geht es nie über einen Proxy aus der Umgebung (`HTTP_PROXY`): Der kennt
+/// dieses `127.0.0.1` nicht.
+fn hedge_client(base: &str, timeout: Duration) -> Result<reqwest::Client> {
+    let local = ["http://127.", "http://localhost", "http://[::1]"]
+        .iter()
+        .any(|p| base.starts_with(p));
+    let builder = reqwest::Client::builder().timeout(timeout);
+    Ok(if local {
+        builder.no_proxy().build()?
+    } else {
+        builder.build()?
+    })
+}
+
 impl Control {
     pub(crate) fn new(config_path: &Path, remote: Remote) -> Result<Self> {
-        let cfg = Config::load(config_path).ok();
+        let loaded = Config::load(config_path);
+        // Ohne lesbare Config fehlen Adresse und Token. Ist die Datei da,
+        // aber kaputt, läuft Hedge mit der vorigen weiter – das soll die
+        // Meldung sagen, statt zu `hedge init` zu raten.
+        let missing = |flag: &str| -> String {
+            match &loaded {
+                Err(e) if config_path.exists() => format!(
+                    "the config cannot be read, so hedge cannot be found from it (a running hedge keeps its previous config):\n       {e}\n       → fix the file, or pass {flag}"
+                ),
+                _ => format!("no config found: pass {flag} or run `hedge init`"),
+            }
+        };
+        let cfg = loaded.as_ref().ok();
         let base = match remote.url {
             Some(u) => u.trim_end_matches('/').to_owned(),
-            None => format!(
-                "http://{}",
-                cfg.as_ref()
-                    .map(|c| c.server.listen.clone())
-                    .ok_or("no config found: pass --url or run `hedge init`")?
-            ),
+            None => cfg
+                .map(Config::control_url)
+                .ok_or_else(|| missing("--url"))?,
         };
         let token = match remote.token {
             Some(t) => t,
             None => {
                 let path = cfg
-                    .as_ref()
                     .map(|c| c.control_token_path())
-                    .ok_or("no config found: pass --token or run `hedge init`")?;
+                    .ok_or_else(|| missing("--token"))?;
                 std::fs::read_to_string(&path)
                     .map_err(|_| {
                         format!(
@@ -2448,11 +2701,9 @@ impl Control {
             }
         };
         Ok(Self {
+            http: hedge_client(&base, Duration::from_secs(5))?,
             base,
             token,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()?,
         })
     }
 
@@ -2481,6 +2732,85 @@ impl Control {
         }
         Ok(body)
     }
+
+    /// Ein Stück des Witness: die Einträge, die Sequenznummer des letzten
+    /// gelieferten und der Kopf der Kette. `query` ist `after=<seq>` oder
+    /// `last=<n>`.
+    pub(crate) async fn witness(&self, query: &str) -> Result<(Vec<Entry>, u64, u64)> {
+        let resp = self
+            .http
+            .get(format!("{}/_hedge/witness?{query}", self.base))
+            .bearer_auth(&self.token)
+            // Ein Stück kann einige Megabyte groß sein.
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| {
+                format!(
+                    "cannot reach hedge at {} ({}). Is `hedge run` running?",
+                    self.base,
+                    short_err(&e)
+                )
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            let msg = body["error"]["message"].as_str().unwrap_or("");
+            return Err(if msg.contains("unknown upstream") {
+                format!(
+                    "hedge at {} does not serve its witness over the control API (older version, or the control API has its own address – see control.listen)",
+                    self.base
+                )
+                .into()
+            } else {
+                format!("hedge answered {}: {msg}", status.as_u16()).into()
+            });
+        }
+        let number = |name: &str| -> u64 {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        };
+        let (last, head) = (
+            number(proxy::WITNESS_LAST_HEADER),
+            number(proxy::WITNESS_HEAD_HEADER),
+        );
+        let body = resp.bytes().await?;
+        let entries = body
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.iter().all(u8::is_ascii_whitespace))
+            .filter_map(|l| serde_json::from_slice::<Entry>(l).ok())
+            .collect();
+        Ok((entries, last, head))
+    }
+
+    /// Alle Einträge ab `query` bis zum Kopf der Kette.
+    pub(crate) async fn witness_until_head(&self, query: &str) -> Result<Vec<Entry>> {
+        let (mut entries, mut last, mut head) = self.witness(query).await?;
+        while last < head {
+            let (more, l, h) = self.witness(&format!("after={last}")).await?;
+            if l <= last {
+                break;
+            }
+            entries.extend(more);
+            (last, head) = (l, h);
+        }
+        Ok(entries)
+    }
+}
+
+/// Die ganze Kette: aus den Dateien auf diesem Rechner oder, mit `--url`,
+/// über die Steuer-API eines entfernten Hedge.
+async fn load_chain(config_path: &Path, remote: Remote) -> Result<Vec<Entry>> {
+    if remote.url.is_some() {
+        return Control::new(config_path, remote)?
+            .witness_until_head("after=0")
+            .await;
+    }
+    let cfg = load_or_hint(config_path)?;
+    Ok(witness::read_chain(&cfg.witness_path()).unwrap_or_default())
 }
 
 async fn cmd_status(config_path: &Path, remote: Remote, json: bool) -> Result<i32> {
@@ -2501,6 +2831,12 @@ async fn cmd_status(config_path: &Path, remote: Remote, json: bool) -> Result<i3
         human_duration(n(&s["uptime_secs"]) * 1000)
     );
     println!("  listening   {}", s["listen"].as_str().unwrap_or("?"));
+    if let Some(c) = s["control_listen"].as_str() {
+        println!("  control     {c}  {}", "(own address)".dimmed());
+    }
+    if let Some(why) = s["not_ready"].as_str() {
+        println!("  ready       {} {}", fail(), why.red().bold());
+    }
     println!(
         "  requests    {} since start – {} blocked, {} redacted, {} findings",
         n(&since["requests"]),
@@ -2538,6 +2874,39 @@ async fn cmd_status(config_path: &Path, remote: Remote, json: bool) -> Result<i3
                 .map(|h| truncate(h, 24))
                 .unwrap_or_else(|| "-".into())
         );
+        // Ältere Versionen melden diese Felder nicht; dann bleibt es bei der Zeile oben.
+        if w.get("ok").and_then(Value::as_bool) == Some(false) {
+            println!(
+                "              {} {}",
+                fail(),
+                format!(
+                    "last write failed – requests pass without a record: {}",
+                    w.get("last_error").and_then(Value::as_str).unwrap_or("?")
+                )
+                .red()
+            );
+        }
+        if let Some(bytes) = w.get("segment_bytes").and_then(Value::as_u64) {
+            let closed = w.get("segments").and_then(Value::as_u64).unwrap_or(0);
+            let limit = w.get("rotate_mb").and_then(Value::as_u64).unwrap_or(0);
+            let mut line = format!(
+                "active segment {}, {} entries",
+                human_bytes(bytes),
+                w.get("segment_entries")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            );
+            if limit > 0 {
+                line.push_str(&format!(" (rotates at {limit} MiB)"));
+            }
+            if closed > 0 {
+                line.push_str(&format!(
+                    " · {closed} closed segment(s), {}",
+                    human_bytes(w.get("segments_bytes").and_then(Value::as_u64).unwrap_or(0))
+                ));
+            }
+            println!("              {}", line.dimmed());
+        }
     } else {
         println!("  witness     {}", "disabled".yellow());
     }
@@ -2552,10 +2921,14 @@ async fn cmd_status(config_path: &Path, remote: Remote, json: bool) -> Result<i3
         }
         None => println!("  presidio    {}", "off".dimmed()),
     }
-    if s["ready"] == false {
+    // Die Zeile "ready" oben nennt den Grund; hier steht, was er bedeutet.
+    if s["not_ready"]
+        .as_str()
+        .is_some_and(|why| why.contains("presidio"))
+    {
         println!(
-            "  ready       {}",
-            "no – requests that need presidio are rejected until it is back"
+            "              {}",
+            "requests that need presidio are rejected until it is back"
                 .red()
                 .bold()
         );
@@ -2567,6 +2940,8 @@ async fn cmd_status(config_path: &Path, remote: Remote, json: bool) -> Result<i3
     {
         for u in used {
             let tokens = n(&u["tokens"]);
+            // Ein Client kann ein eigenes Tagesbudget haben.
+            let daily = u["limit"].as_u64().unwrap_or(daily);
             let limit = if daily > 0 {
                 format!(
                     " of {} ({}%)",
@@ -2677,6 +3052,143 @@ async fn cmd_resolve(config_path: &Path, remote: Remote, id: &str, approve: bool
 
 // ---------- client ----------
 
+/// Clients und Admins stehen gleich in der Config: als `[[clients]]` bzw.
+/// `[[admins]]` mit Name und Hash des Tokens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Who {
+    Client,
+    Admin,
+}
+
+impl Who {
+    fn table(self) -> &'static str {
+        match self {
+            Who::Client => "clients",
+            Who::Admin => "admins",
+        }
+    }
+    fn word(self) -> &'static str {
+        match self {
+            Who::Client => "client",
+            Who::Admin => "admin",
+        }
+    }
+    /// Am Präfix erkennt ein Mensch, wofür ein Token ist.
+    fn token(self) -> Result<String> {
+        let prefix = match self {
+            Who::Client => "hc",
+            Who::Admin => "ha",
+        };
+        Ok(format!("{prefix}_{}", random_hex(24)?))
+    }
+    fn exists(self, cfg: &Config, name: &str) -> bool {
+        match self {
+            Who::Client => cfg.clients.iter().any(|c| c.name == name),
+            Who::Admin => cfg.admins.iter().any(|a| a.name == name),
+        }
+    }
+}
+
+/// Byte-Bereich des Blocks `[[table]]`, dessen `name` passt. Der Block
+/// reicht bis zur nächsten Tabelle; Kommentare und Leerzeilen direkt davor
+/// gehören zu ihr und bleiben stehen.
+fn table_block(text: &str, table: &str, name: &str) -> Option<(usize, usize)> {
+    let header = format!("[[{table}]]");
+    let is_header = |line: &str| line.trim_start().starts_with('[');
+    let lines: Vec<(usize, &str)> = text
+        .split_inclusive('\n')
+        .scan(0, |at, line| {
+            let start = *at;
+            *at += line.len();
+            Some((start, line))
+        })
+        .collect();
+    for (i, (start, line)) in lines.iter().enumerate() {
+        if line.split('#').next().unwrap_or("").trim() != header {
+            continue;
+        }
+        let next = lines[i + 1..]
+            .iter()
+            .position(|(_, l)| is_header(l))
+            .map_or(lines.len(), |n| i + 1 + n);
+        // Was direkt vor der nächsten Tabelle steht, gehört zu ihr.
+        let mut end = next;
+        while end > i + 1 {
+            let l = lines[end - 1].1.trim();
+            if l.is_empty() || l.starts_with('#') {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        let stop = lines.get(end).map_or(text.len(), |(at, _)| *at);
+        let block = &text[*start..stop];
+        let matches = toml::from_str::<toml::Table>(block)
+            .ok()
+            .and_then(|t| {
+                t.get(table)?
+                    .as_array()?
+                    .first()?
+                    .get("name")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .is_some_and(|n| n == name);
+        if matches {
+            return Some((*start, stop));
+        }
+    }
+    None
+}
+
+/// Entfernt den Block samt einer angrenzenden Leerzeile: der davor, oder –
+/// steht direkt über dem Block ein Kommentar – der danach.
+fn without_block(text: &str, table: &str, name: &str) -> Option<String> {
+    let (start, stop) = table_block(text, table, name)?;
+    let (head, tail) = (&text[..start], &text[stop..]);
+    Some(match head.strip_suffix("\n\n") {
+        Some(h) => format!("{h}\n{tail}"),
+        None => format!("{head}{}", tail.strip_prefix('\n').unwrap_or(tail)),
+    })
+}
+
+/// Ersetzt den Hash des Tokens im Block.
+fn with_new_hash(text: &str, table: &str, name: &str, sha: &str) -> Option<String> {
+    let (start, stop) = table_block(text, table, name)?;
+    let mut done = false;
+    let block: String = text[start..stop]
+        .split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_start();
+            if !done && body.starts_with("token_sha256") {
+                done = true;
+                let indent = &line[..line.len() - body.len()];
+                let ending = if line.ends_with('\n') { "\n" } else { "" };
+                format!("{indent}token_sha256 = \"{sha}\"{ending}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    done.then(|| format!("{}{block}{}", &text[..start], &text[stop..]))
+}
+
+/// Prüft den neuen Text und schreibt ihn erst dann: Eine kaputte Config
+/// darf nie entstehen.
+fn write_config(config_path: &Path, text: &str, what: &str) -> Result<()> {
+    Config::from_toml(text)
+        .map_err(|e| e.to_string())
+        .and_then(|c| c.validate().map_err(|e| e.to_string()))
+        .map_err(|e| format!("{what} would break the config: {e}"))?;
+    std::fs::write(config_path, text).map_err(|e| {
+        format!(
+            "cannot write {}: {e}\n       → if the config comes from Git or a ConfigMap, use --print and add the block there",
+            config_path.display()
+        )
+        .into()
+    })
+}
+
 fn cmd_client(config_path: &Path, command: ClientCommand) -> Result<i32> {
     let cfg = load_or_hint(config_path)?;
     match command {
@@ -2688,8 +3200,25 @@ fn cmd_client(config_path: &Path, command: ClientCommand) -> Result<i32> {
                     "hedge client add <name>".cyan()
                 );
             }
+            let today = Utc::now().format("%Y-%m-%d").to_string();
             for c in &cfg.clients {
-                println!("  {}  {}…", pad(&c.name, 20).bold(), &c.token_sha256[..12]);
+                let mut notes = Vec::new();
+                if let Some(n) = c.daily_tokens {
+                    notes.push(format!("{} tokens/day", human_count(n)));
+                }
+                match &c.expires {
+                    Some(day) if c.expired_on(&today) => {
+                        notes.push(format!("expired {day}").red().to_string())
+                    }
+                    Some(day) => notes.push(format!("until {day}")),
+                    None => {}
+                }
+                println!(
+                    "  {}  {}…  {}",
+                    pad(&c.name, 20).bold(),
+                    &c.token_sha256[..12],
+                    notes.join(" · ").dimmed()
+                );
             }
             println!(
                 "  token required: {}",
@@ -2702,50 +3231,29 @@ fn cmd_client(config_path: &Path, command: ClientCommand) -> Result<i32> {
             println!();
             Ok(0)
         }
-        ClientCommand::Add { name } => {
-            if name.trim().is_empty() || name.contains(['"', '\n', '\\']) {
-                return Err("client name must be a simple, non-empty string".into());
+        ClientCommand::Add {
+            name,
+            print,
+            expires,
+            daily_tokens,
+        } => {
+            let mut extra = String::new();
+            if let Some(n) = daily_tokens {
+                extra.push_str(&format!("daily_tokens = {n}\n"));
             }
-            if cfg.clients.iter().any(|c| c.name == name) {
-                return Err(format!("client {name:?} already exists").into());
+            if let Some(day) = &expires {
+                extra.push_str(&format!("expires = \"{day}\"\n"));
             }
-            let token = format!("hc_{}", random_hex(24)?);
-            let sha = witness::sha256_hex(token.as_bytes());
-            let mut text = std::fs::read_to_string(config_path)?;
-            if !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&format!(
-                "\n[[clients]]\nname = \"{name}\"\ntoken_sha256 = \"{sha}\"\n"
-            ));
-            // Erst prüfen, dann schreiben: Eine kaputte Config darf nie entstehen.
-            Config::from_toml(&text)
-                .map_err(|e| e.to_string())
-                .and_then(|c| c.validate().map_err(|e| e.to_string()))
-                .map_err(|e| format!("adding the client would break the config: {e}"))?;
-            std::fs::write(config_path, text)?;
-
+            let token = add_person(config_path, &cfg, Who::Client, &name, &extra, print)?;
             let first = cfg
                 .upstreams
                 .first()
                 .map(|u| u.name.as_str())
                 .unwrap_or("anthropic");
-            println!();
-            println!(
-                "  {} client {} added to {}",
-                ok(),
-                name.bold(),
-                config_path.display()
-            );
-            println!("    A running hedge picks this up within seconds.");
-            println!();
-            println!("  Token (shown once, hedge only stores its hash):");
-            println!("    {}", token.yellow());
-            println!();
             println!("  Give {name} these two lines:");
             println!(
                 "    {}",
-                format!("export ANTHROPIC_BASE_URL=http://<hedge-host>:<port>/{first}").cyan()
+                format!("export ANTHROPIC_BASE_URL=https://<hedge-host>/{first}").cyan()
             );
             println!(
                 "    {}",
@@ -2762,7 +3270,323 @@ fn cmd_client(config_path: &Path, command: ClientCommand) -> Result<i32> {
             println!();
             Ok(0)
         }
+        ClientCommand::Remove { name } => remove_person(config_path, &cfg, Who::Client, &name),
+        ClientCommand::Rotate { name, print } => {
+            rotate_person(config_path, &cfg, Who::Client, &name, print)
+        }
     }
+}
+
+fn cmd_admin(config_path: &Path, command: AdminCommand) -> Result<i32> {
+    let cfg = load_or_hint(config_path)?;
+    match command {
+        AdminCommand::List => {
+            println!();
+            if cfg.admins.is_empty() {
+                println!(
+                    "  no admins configured. Add one: {}",
+                    "hedge admin add <name>".cyan()
+                );
+                println!(
+                    "  {}",
+                    "Without admins, only the local control token can approve – and approvals carry no name."
+                        .dimmed()
+                );
+            }
+            for a in &cfg.admins {
+                println!("  {}  {}…", pad(&a.name, 20).bold(), &a.token_sha256[..12]);
+            }
+            println!();
+            Ok(0)
+        }
+        AdminCommand::Add { name, print } => {
+            let token = add_person(config_path, &cfg, Who::Admin, &name, "", print)?;
+            println!("  Give {name} these two lines:");
+            println!(
+                "    {}",
+                "export HEDGE_URL=https://<hedge-admin-host>".cyan()
+            );
+            println!(
+                "    {}",
+                format!("export HEDGE_CONTROL_TOKEN={token}").cyan()
+            );
+            println!(
+                "  Then {}, {}, {} and {} work from their machine,",
+                "hedge status".cyan(),
+                "hedge approvals".cyan(),
+                "hedge tail -f".cyan(),
+                "hedge watch".cyan()
+            );
+            println!("  and every approval is recorded as “via control api ({name})”.");
+            println!();
+            Ok(0)
+        }
+        AdminCommand::Remove { name } => remove_person(config_path, &cfg, Who::Admin, &name),
+        AdminCommand::Rotate { name, print } => {
+            rotate_person(config_path, &cfg, Who::Admin, &name, print)
+        }
+    }
+}
+
+/// Legt einen Client oder Admin an und liefert das Token (einmal sichtbar).
+fn add_person(
+    config_path: &Path,
+    cfg: &Config,
+    who: Who,
+    name: &str,
+    extra: &str,
+    print: bool,
+) -> Result<String> {
+    if !config::valid_name(name) {
+        return Err(format!(
+            "{} name must be 1–64 characters of a-z, A-Z, 0-9, '-', '_', '.', '@'",
+            who.word()
+        )
+        .into());
+    }
+    if who.exists(cfg, name) {
+        return Err(format!("{} {name:?} already exists", who.word()).into());
+    }
+    let token = who.token()?;
+    let sha = witness::sha256_hex(token.as_bytes());
+    let block = format!(
+        "[[{}]]\nname = \"{name}\"\ntoken_sha256 = \"{sha}\"\n{extra}",
+        who.table()
+    );
+    let mut text = std::fs::read_to_string(config_path)?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push('\n');
+    text.push_str(&block);
+
+    println!();
+    if print {
+        // Auch ohne zu schreiben prüfen, ob der Block zur Config passt.
+        Config::from_toml(&text)
+            .map_err(|e| e.to_string())
+            .and_then(|c| c.validate().map_err(|e| e.to_string()))
+            .map_err(|e| format!("this {} would break the config: {e}", who.word()))?;
+        println!(
+            "  Add this block to the config ({} was not changed):",
+            config_path.display()
+        );
+        println!();
+        for line in block.lines() {
+            println!("    {line}");
+        }
+    } else {
+        write_config(config_path, &text, &format!("adding the {}", who.word()))?;
+        println!(
+            "  {} {} {} added to {}",
+            ok(),
+            who.word(),
+            name.bold(),
+            config_path.display()
+        );
+        println!("    A running hedge picks this up within seconds.");
+    }
+    println!();
+    println!("  Token (shown once, hedge only stores its hash):");
+    println!("    {}", token.yellow());
+    println!();
+    Ok(token)
+}
+
+fn remove_person(config_path: &Path, cfg: &Config, who: Who, name: &str) -> Result<i32> {
+    if !who.exists(cfg, name) {
+        return Err(format!("no {} named {name:?}", who.word()).into());
+    }
+    let text = std::fs::read_to_string(config_path)?;
+    let text = without_block(&text, who.table(), name).ok_or_else(|| {
+        format!(
+            "could not find the [[{}]] block of {name:?} in {} – remove it by hand",
+            who.table(),
+            config_path.display()
+        )
+    })?;
+    write_config(config_path, &text, &format!("removing the {}", who.word()))?;
+    println!();
+    println!(
+        "  {} {} {} removed from {}",
+        ok(),
+        who.word(),
+        name.bold(),
+        config_path.display()
+    );
+    println!("    A running hedge rejects the token within seconds.");
+    println!();
+    Ok(0)
+}
+
+fn rotate_person(
+    config_path: &Path,
+    cfg: &Config,
+    who: Who,
+    name: &str,
+    print: bool,
+) -> Result<i32> {
+    if !who.exists(cfg, name) {
+        return Err(format!("no {} named {name:?}", who.word()).into());
+    }
+    let token = who.token()?;
+    let sha = witness::sha256_hex(token.as_bytes());
+    println!();
+    if print {
+        println!(
+            "  Replace token_sha256 of {} {} with ({} was not changed):",
+            who.word(),
+            name.bold(),
+            config_path.display()
+        );
+        println!();
+        println!("    token_sha256 = \"{sha}\"");
+    } else {
+        let text = std::fs::read_to_string(config_path)?;
+        let text = with_new_hash(&text, who.table(), name, &sha).ok_or_else(|| {
+            format!(
+                "could not find the [[{}]] block of {name:?} in {} – use --print and edit by hand",
+                who.table(),
+                config_path.display()
+            )
+        })?;
+        write_config(
+            config_path,
+            &text,
+            &format!("rotating the {} token", who.word()),
+        )?;
+        println!(
+            "  {} new token for {} {} in {}",
+            ok(),
+            who.word(),
+            name.bold(),
+            config_path.display()
+        );
+        println!("    The old token stops working within seconds.");
+    }
+    println!();
+    println!("  Token (shown once, hedge only stores its hash):");
+    println!("    {}", token.yellow());
+    println!();
+    Ok(0)
+}
+
+// ---------- init --keys-only / ready / rotate ----------
+
+/// Legt an, was geheim ist und deshalb nie aus Git oder einer ConfigMap
+/// kommt: Signierschlüssel und Steuer-Token. Ohne `--dir` an den Pfaden der
+/// Config, mit `--dir` in diesem Verzeichnis. Vorhandenes bleibt unberührt
+/// und der Aufruf ist dann still – er darf vor jedem Start laufen.
+fn cmd_init_keys(config_path: &Path, dir: Option<PathBuf>) -> Result<i32> {
+    let (key_path, token_path) = match dir {
+        Some(dir) => (Some(dir.join("witness.key")), dir.join("control.token")),
+        None => {
+            let cfg = load_or_hint(config_path)?;
+            (
+                cfg.witness.enabled.then(|| cfg.witness_key_path()),
+                cfg.control_token_path(),
+            )
+        }
+    };
+    if let Some(key_path) = key_path
+        && !key_path.exists()
+    {
+        if let Some(dir) = key_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let vk = witness::generate_keypair(&key_path)?;
+        println!(
+            "created signing key {} (key id {}) – back it up, the chain is checked against it",
+            key_path.display(),
+            witness::key_id_of(&vk)
+        );
+    }
+    if !token_path.exists() {
+        if let Some(dir) = token_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        witness::write_private(&token_path, random_hex(32)?.as_bytes())?;
+        println!("created control token {}", token_path.display());
+    }
+    Ok(0)
+}
+
+/// Für Healthchecks (Docker, systemd, Monitoring): fragt `/ready` und sagt
+/// es mit dem Exit-Code. Braucht kein Token.
+async fn cmd_ready(config_path: &Path, url: Option<String>) -> Result<i32> {
+    let base = match url {
+        Some(u) => u.trim_end_matches('/').to_owned(),
+        None => load_or_hint(config_path)?.proxy_url(),
+    };
+    let http = hedge_client(&base, Duration::from_secs(4))?;
+    match http.get(format!("{base}/ready")).send().await {
+        Ok(r) if r.status().is_success() => {
+            println!("ready");
+            Ok(0)
+        }
+        Ok(r) if r.status().as_u16() == 503 => {
+            let body: Value = r.json().await.unwrap_or(Value::Null);
+            let waiting: Vec<&str> = body["waiting_for"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if waiting.is_empty() {
+                println!("not ready: {base}/ready answered HTTP 503 without a reason");
+            } else {
+                println!("not ready: {}", waiting.join(", "));
+            }
+            Ok(1)
+        }
+        Ok(r) => {
+            println!(
+                "not ready: {base}/ready answered HTTP {} (is that a hedge of this version?)",
+                r.status().as_u16()
+            );
+            Ok(1)
+        }
+        Err(e) => {
+            println!(
+                "not ready: cannot reach hedge at {base} ({})",
+                short_err(&e)
+            );
+            Ok(1)
+        }
+    }
+}
+
+async fn cmd_rotate(config_path: &Path, remote: Remote) -> Result<i32> {
+    let control = Control::new(config_path, remote)?;
+    let v = control
+        .call(reqwest::Method::POST, "/_hedge/witness/rotate")
+        .await?;
+    println!();
+    match v["rotated"].as_object() {
+        Some(seg) => {
+            println!(
+                "  {} segment closed: {}",
+                ok(),
+                seg["file"].as_str().unwrap_or("?").bold()
+            );
+            println!(
+                "    entries #{} to #{}, {}",
+                seg["first"].as_u64().unwrap_or(0),
+                seg["last"].as_u64().unwrap_or(0),
+                human_bytes(seg["bytes"].as_u64().unwrap_or(0))
+            );
+            println!(
+                "    The chain continues in the active file; `hedge verify` checks all segments."
+            );
+            println!(
+                "    The closed segment never changes again – archive it, and keep `hedge head` somewhere else."
+            );
+        }
+        None => println!(
+            "  {} nothing to rotate: the active segment is empty",
+            "·".dimmed()
+        ),
+    }
+    println!();
+    Ok(0)
 }
 
 // ---------- doctor ----------
@@ -2799,8 +3623,8 @@ async fn cmd_doctor(config_path: &Path) -> Result<i32> {
             ok(),
             cfg.server.listen
         ),
-        Err(_) => match http
-            .get(format!("http://{}/health", cfg.server.listen))
+        Err(_) => match hedge_client(&cfg.proxy_url(), Duration::from_secs(5))?
+            .get(format!("{}/health", cfg.proxy_url()))
             .send()
             .await
         {
@@ -2868,15 +3692,21 @@ async fn cmd_doctor(config_path: &Path) -> Result<i32> {
                     witness::key_id_of(&vk)
                 );
                 let path = cfg.witness_path();
-                match witness::read_entries(&path) {
+                match witness::read_chain(&path) {
                     Ok(entries) => {
                         let report = witness::verify(&entries, &vk);
                         if report.is_ok() {
+                            let closed = witness::segments(&path).len();
                             println!(
-                                "  {} witness       {} – {} entries, chain intact",
+                                "  {} witness       {} – {} entries, chain intact{}",
                                 ok(),
                                 path.display(),
-                                report.entries
+                                report.entries,
+                                if closed > 0 {
+                                    format!(" ({closed} closed segment(s) included)")
+                                } else {
+                                    String::new()
+                                }
                             );
                         } else {
                             problems += 1;
@@ -3001,16 +3831,44 @@ async fn cmd_doctor(config_path: &Path) -> Result<i32> {
     }
     problems += presidio::doctor(&cfg).await;
 
-    // 7. Agent-Setup
-    let expected = agent_url(&cfg);
-    let shell = std::env::var("ANTHROPIC_BASE_URL").ok();
-    let settings = claude_settings_url();
-    match judge_agent_setup(&expected, shell.as_deref(), settings.as_deref()) {
-        Ok(line) => println!("  {} claude code   {line}", ok()),
-        Err((what, fix)) => {
-            problems += 1;
-            println!("  {} claude code   {what}", fail());
-            println!("                   → {fix}");
+    // 7. Agent-Setup. Ein zentraler Hedge hat keine Agents auf seinem
+    // eigenen Rechner – deren Einstellungen liegen bei den Entwicklern.
+    // Zentral heißt: am Netz, oder hinter einem Reverse Proxy mit Clients
+    // und Admins.
+    let gateway = !cfg.is_loopback()
+        || cfg.server.require_client
+        || !cfg.clients.is_empty()
+        || !cfg.admins.is_empty();
+    if !gateway {
+        let expected = agent_url(&cfg);
+        let shell = std::env::var("ANTHROPIC_BASE_URL").ok();
+        let settings = claude_settings_url();
+        match judge_agent_setup(&expected, shell.as_deref(), settings.as_deref()) {
+            Ok(line) => println!("  {} claude code   {line}", ok()),
+            Err((what, fix)) => {
+                problems += 1;
+                println!("  {} claude code   {what}", fail());
+                println!("                   → {fix}");
+            }
+        }
+    } else {
+        println!(
+            "  {} agents        central gateway: {} client(s), {} admin(s) – agents point here from other machines",
+            "·".dimmed(),
+            cfg.clients.len(),
+            cfg.admins.len()
+        );
+        if cfg.control_listen().is_none() {
+            println!(
+                "  {} control API   shares the proxy port – keep /_hedge/* away from developers at the reverse proxy, or set control.listen",
+                "!".yellow()
+            );
+        }
+        if cfg.admins.is_empty() {
+            println!(
+                "  {} admins        none – approvals from other machines need the shared control token and carry no name (hedge admin add <name>)",
+                "!".yellow()
+            );
         }
     }
 
@@ -3152,6 +4010,20 @@ pub(crate) fn human_duration(ms: u64) -> String {
 }
 
 /// 1234 → `1.2k`, 3_400_000 → `3.4M`
+pub(crate) fn human_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let n = n as f64;
+    if n >= KIB * KIB * KIB {
+        format!("{:.1} GiB", n / (KIB * KIB * KIB))
+    } else if n >= KIB * KIB {
+        format!("{:.1} MiB", n / (KIB * KIB))
+    } else if n >= KIB {
+        format!("{:.0} KiB", n / KIB)
+    } else {
+        format!("{n:.0} B")
+    }
+}
+
 pub(crate) fn human_count(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -3472,5 +4344,114 @@ mod tests {
             doc["env"]["ANTHROPIC_BASE_URL"],
             "http://127.0.0.1:18765/anthropic"
         );
+    }
+
+    const CONFIG: &str = r#"mode = "observe"
+
+[server]
+listen = "0.0.0.0:18765"
+require_client = true
+
+# Die Entwickler
+[[clients]]
+name = "alice"
+token_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+daily_tokens = 5000
+
+[[clients]]
+name = "bob"
+  token_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"   # eingerückt
+expires = "2027-01-31"
+
+# Wer freigeben darf
+[[admins]]
+name = "anna"
+token_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+# [[clients]]
+# name = "alice"
+# token_sha256 = "…"
+
+[budget]
+daily_tokens = 1000
+"#;
+
+    #[test]
+    fn a_block_is_found_by_table_and_name_only() {
+        let (a, b) = table_block(CONFIG, "clients", "alice").expect("alice");
+        let block = &CONFIG[a..b];
+        assert!(block.starts_with("[[clients]]\nname = \"alice\""));
+        assert!(block.ends_with("daily_tokens = 5000\n"), "{block:?}");
+
+        let (a, b) = table_block(CONFIG, "admins", "anna").expect("anna");
+        assert!(
+            CONFIG[a..b].ends_with("cccc\"\n"),
+            "the commented example is not hers"
+        );
+
+        assert!(table_block(CONFIG, "admins", "alice").is_none());
+        assert!(table_block(CONFIG, "clients", "anna").is_none());
+        assert!(table_block(CONFIG, "clients", "nobody").is_none());
+    }
+
+    #[test]
+    fn removing_a_block_leaves_the_rest_as_it_was() {
+        let text = without_block(CONFIG, "clients", "alice").expect("removed");
+        let cfg = Config::from_toml(&text).expect("still valid toml");
+        assert_eq!(
+            cfg.clients
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["bob"]
+        );
+        assert_eq!(cfg.admins.len(), 1);
+        assert_eq!(cfg.budget.daily_tokens, 1000);
+        assert!(text.contains("# Die Entwickler\n[[clients]]\nname = \"bob\""));
+        assert!(text.contains("# Wer freigeben darf\n[[admins]]"));
+        assert!(
+            text.contains("# [[clients]]\n# name = \"alice\""),
+            "comments stay"
+        );
+        let (a, b) = table_block(CONFIG, "clients", "alice").unwrap();
+        assert_eq!(
+            text.len(),
+            CONFIG.len() - (b - a) - 1,
+            "exactly the block and one blank line"
+        );
+
+        // Der letzte Block der Datei.
+        let tail = "[[clients]]\nname = \"x\"\ntoken_sha256 = \"dd\"\n\n[[clients]]\nname = \"y\"\ntoken_sha256 = \"ee\"\n";
+        assert_eq!(
+            without_block(tail, "clients", "y").unwrap(),
+            "[[clients]]\nname = \"x\"\ntoken_sha256 = \"dd\"\n"
+        );
+    }
+
+    #[test]
+    fn rotating_replaces_only_the_hash_of_that_block() {
+        let new = "f".repeat(64);
+        let text = with_new_hash(CONFIG, "clients", "bob", &new).expect("rotated");
+        let cfg = Config::from_toml(&text).expect("still valid toml");
+        assert_eq!(cfg.clients[1].token_sha256, new);
+        assert_eq!(cfg.clients[1].expires.as_deref(), Some("2027-01-31"));
+        assert!(
+            cfg.clients[0].token_sha256.starts_with("aaaa"),
+            "alice keeps hers"
+        );
+        assert!(cfg.admins[0].token_sha256.starts_with("cccc"));
+        assert!(
+            text.contains(&format!("  token_sha256 = \"{new}\"\n")),
+            "indent kept"
+        );
+        assert!(with_new_hash(CONFIG, "clients", "nobody", &new).is_none());
+    }
+
+    #[test]
+    fn sizes_read_like_a_human_would_say_them() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(64 * 1024), "64 KiB");
+        assert_eq!(human_bytes(64 * 1024 * 1024), "64.0 MiB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024 / 2), "1.5 GiB");
     }
 }
