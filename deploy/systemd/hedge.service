@@ -1,0 +1,67 @@
+# Hedge – AI Guard Proxy as a systemd service.
+# Install: see deploy/systemd/README.md.
+
+[Unit]
+Description=Hedge – AI Guard Proxy
+Documentation=https://github.com/munichbughunter/hedge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hedge
+Group=hedge
+Environment=HEDGE_CONFIG=/etc/hedge/hedge.toml
+Environment=HOME=/var/lib/hedge
+# A corporate forward proxy, if this host needs one to reach the LLM API:
+# Environment=HTTPS_PROXY=http://proxy.example.com:3128
+# Environment=NO_PROXY=localhost,127.0.0.1
+
+# Creates the signing key and the control token on first start; existing
+# ones are never touched.
+ExecStartPre=/usr/local/bin/hedge init --keys-only
+ExecStart=/usr/local/bin/hedge run
+# SIGHUP reloads the config (Hedge also notices a changed file by itself).
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=2
+# A little longer than server.shutdown_grace_secs (30).
+TimeoutStopSec=45
+LimitNOFILE=65536
+
+# /var/lib/hedge (witness, key, token), owned by the service user.
+StateDirectory=hedge
+StateDirectoryMode=0750
+UMask=0027
+
+# The service needs the network, its config and its state directory –
+# nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

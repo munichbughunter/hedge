@@ -1,0 +1,24 @@
+# hedge.toml – the config baked into the image.
+#
+# It is enough to start and look around: observe mode, nothing is changed or
+# blocked. For real use mount your own file over /etc/hedge (a directory
+# mount, so edits reach the running container). `hedge deploy compose`
+# writes a complete directory with a commented central config, Presidio
+# included. Every option: hedge.example.toml.
+
+mode = "observe"
+
+[server]
+listen = "0.0.0.0:18765"
+
+[control]
+token = "/var/lib/hedge/control.token"
+listen = "0.0.0.0:18766"
+
+[witness]
+path = "/var/lib/hedge/witness.jsonl"
+key = "/var/lib/hedge/witness.key"
+rotate_mb = 64
+
+[log]
+format = "json"

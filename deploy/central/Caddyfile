@@ -1,0 +1,50 @@
+# Caddy vor Hedge: TLS, Streaming und eine Tür nur für Admins.
+# Geschrieben von `hedge deploy compose`; aktiv mit COMPOSE_PROFILES=tls.
+#
+# Was ein Reverse Proxy vor Hedge leisten muss – dieselbe Liste gilt für
+# nginx und für einen Ingress:
+#   1. Antworten nie puffern (es sind Server-Sent Events)
+#   2. lange, stille Verbindungen zulassen (ein angehaltener Tool-Aufruf
+#      wartet auf einen Menschen)
+#   3. Anfragen so groß durchlassen wie server.max_body_mb
+#   4. kein HTTP→HTTPS-Redirect für die API (ein Redirect kann den Body kosten)
+#   5. /_hedge/* nur für Admins
+#   6. Header unverändert durchreichen
+{
+	# Kein Port 80, kein Redirect: Agents bekommen die https://-Adresse und
+	# sonst nichts.
+	auto_https disable_redirects
+}
+
+{$HEDGE_DOMAIN} {
+	tls {$HEDGE_TLS}
+
+	# Die Steuer-API hat ihren eigenen Port (control.listen). Admin-Netze
+	# erreichen sie hier; für alle anderen gibt es den Pfad nicht.
+	@control path /_hedge/*
+	handle @control {
+		@admins remote_ip {$HEDGE_ADMIN_CIDRS}
+		handle @admins {
+			reverse_proxy hedge:18766
+		}
+		respond 404
+	}
+
+	# Liveness und Readiness sind für die Plattform da, nicht fürs Netz.
+	@probes path /health /ready
+	handle @probes {
+		respond 404
+	}
+
+	handle {
+		# Größeres wird schon hier abgelehnt; Hedge antwortet oberhalb seiner
+		# eigenen Grenze (server.max_body_mb) mit 413 und einem Grund.
+		request_body {
+			max_size 32MB
+		}
+		reverse_proxy hedge:18765 {
+			# Jedes Stück sofort weitergeben.
+			flush_interval -1
+		}
+	}
+}

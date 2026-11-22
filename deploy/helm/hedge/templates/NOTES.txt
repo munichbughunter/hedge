@@ -1,0 +1,51 @@
+Hedge is starting as a single instance ({{ include "hedge.fullname" . }}).
+
+1. Wait for it and look at its state:
+
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "hedge.fullname" . }}
+   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "hedge.fullname" . }} -- hedge status
+
+2. Add a developer and an admin. The config comes from this chart, so print
+   the blocks and add them to `config` in your values:
+
+   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "hedge.fullname" . }} -- hedge client add alice --print
+   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "hedge.fullname" . }} -- hedge admin add anna --print
+
+   Then set `require_client = true` and run `helm upgrade`. Hedge picks the
+   new config up without a restart.
+
+3. Agents point at the proxy:
+{{- if .Values.ingress.enabled }}
+
+   ANTHROPIC_BASE_URL=http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}/anthropic
+{{- else }}
+
+   The proxy has no ingress yet (ingress.enabled=false). Inside the cluster:
+   http://{{ include "hedge.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/anthropic
+{{- end }}
+
+4. Admins reach the control API:
+{{- if .Values.controlIngress.enabled }}
+
+   export HEDGE_URL=http{{ if .Values.controlIngress.tls.enabled }}s{{ end }}://{{ .Values.controlIngress.host }}
+   export HEDGE_CONTROL_TOKEN=<the admin token>
+   hedge status
+{{- else }}
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hedge.fullname" . }}-control {{ .Values.control.service.port }}
+   export HEDGE_URL=http://127.0.0.1:{{ .Values.control.service.port }}
+   export HEDGE_CONTROL_TOKEN=<the admin token>
+   hedge status
+{{- end }}
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence is off. The witness chain and its signing key are lost
+when the pod goes away.
+{{- end }}
+
+The signing key was created on the volume at first start. Back it up: the
+chain is verified against it.
+
+   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "hedge.fullname" . }} -- cat /var/lib/hedge/witness.key.pub
+
+Runbook: docs/operations.md in the Hedge repository.

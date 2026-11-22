@@ -1,0 +1,126 @@
+# hedge-presidio: Konfiguration des Presidio-Analyzers für Hedge.
+#
+# Zwei Sprachen (Deutsch, Englisch), je ein spaCy-Modell für Namen und Orte,
+# dazu die Muster-Erkenner, die Hedge abfragen kann. Welche Arten Hedge
+# tatsächlich anfragt, steht in der hedge.toml unter [presidio] entities.
+#
+# Weitere Sprache: Modell unter `models` eintragen, Sprachcode oben und bei
+# den Erkennern ergänzen, Image neu bauen (`hedge presidio enable --build`).
+supported_languages:
+  - de
+  - en
+default_score_threshold: 0
+
+nlp_configuration:
+  nlp_engine_name: spacy
+  models:
+    - lang_code: de
+      model_name: de_core_news_md
+    - lang_code: en
+      model_name: en_core_web_md
+
+  ner_model_configuration:
+    model_to_presidio_entity_mapping:
+      PER: PERSON
+      PERSON: PERSON
+      NORP: NRP
+      FAC: LOCATION
+      LOC: LOCATION
+      LOCATION: LOCATION
+      GPE: LOCATION
+      DATE: DATE_TIME
+      TIME: DATE_TIME
+    low_confidence_score_multiplier: 0.4
+    low_score_entity_names: []
+    # Organisationen und Sammelklassen erzeugen in Code und Logs vor allem
+    # Fehlalarme (Produkt- und Projektnamen).
+    labels_to_ignore:
+      - ORG
+      - ORGANIZATION
+      - MISC
+      - CARDINAL
+      - EVENT
+      - LANGUAGE
+      - LAW
+      - MONEY
+      - ORDINAL
+      - PERCENT
+      - PRODUCT
+      - QUANTITY
+      - WORK_OF_ART
+
+recognizer_registry:
+  global_regex_flags: 26
+  recognizers:
+    # Ohne Sprachangabe entsteht je eine Instanz pro Sprache oben.
+    # Namen und Orte aus dem Sprachmodell.
+    - name: SpacyRecognizer
+      type: predefined
+    - name: CreditCardRecognizer
+      type: predefined
+      supported_languages:
+        - language: de
+          context: [kreditkarte, kartennummer, karte, visa, mastercard, amex, maestro]
+        - language: en
+          context: [credit, card, visa, mastercard, cc, amex, discover, jcb, diners, maestro]
+    - name: IbanRecognizer
+      type: predefined
+    # Eine Telefonnummer ohne Stichwort davor bleibt unter Hedges Schwelle
+    # (0.6): Zeitstempel und IDs sehen sonst aus wie Rufnummern.
+    - name: PhoneRecognizer
+      type: predefined
+      supported_languages:
+        - language: de
+          context: [telefon, telefonnummer, tel, handy, mobil, mobilnummer, rufnummer, durchwahl, fax, anrufen, erreichbar]
+        - language: en
+          context: [phone, number, telephone, cell, cellphone, mobile, call]
+    - name: EmailRecognizer
+      type: predefined
+    - name: IpRecognizer
+      type: predefined
+    - name: UrlRecognizer
+      type: predefined
+    - name: CryptoRecognizer
+      type: predefined
+    - name: DateRecognizer
+      type: predefined
+
+    # Deutschland: in Presidio vorhanden, dort aber standardmäßig aus.
+    - name: DeTaxIdRecognizer
+      type: predefined
+      supported_languages: [de]
+      country_code: de
+    - name: DeIdCardRecognizer
+      type: predefined
+      supported_languages: [de]
+      country_code: de
+    - name: DePassportRecognizer
+      type: predefined
+      supported_languages: [de]
+      country_code: de
+    - name: DeSocialSecurityRecognizer
+      type: predefined
+      supported_languages: [de]
+      country_code: de
+    - name: DeHealthInsuranceRecognizer
+      type: predefined
+      supported_languages: [de]
+      country_code: de
+    - name: DeFuehrerscheinRecognizer
+      type: predefined
+      supported_languages: [de]
+      country_code: de
+
+    # USA / UK: für englische Texte.
+    - name: UsSsnRecognizer
+      type: predefined
+      supported_languages: [en]
+      country_code: us
+    - name: UsPassportRecognizer
+      type: predefined
+      supported_languages: [en]
+      country_code: us
+    - name: NhsRecognizer
+      type: predefined
+      supported_languages: [en]
+      country_code: uk

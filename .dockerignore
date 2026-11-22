@@ -1,0 +1,11 @@
+# Keep the build context small and the image free of local state.
+target/
+.git/
+.gitignore
+.DS_Store
+Claude outputs/
+docs/
+tests/
+*.md
+# deploy/ stays in the context: the templates for `hedge deploy compose`
+# and the files of the Presidio image are compiled into the binary.

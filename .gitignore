@@ -1,2 +1,8 @@
 /target
 .DS_Store
+
+# A directory written by `hedge deploy compose` next to the sources
+/hedge-central/
+# Certificates never belong in the repository
+deploy/central/certs/*
+!deploy/central/certs/README.md

@@ -1,0 +1,98 @@
+# hedge.toml – central gateway
+#
+# One Hedge for a team: developers point their agents at it, admins watch and
+# approve from their own machines. This file is the commented starting point
+# for a host install (deploy/systemd); every option is explained in
+# hedge.example.toml. The Compose directory written by `hedge deploy compose`
+# and the Helm chart bring their own config.
+#
+# Hedge reloads this file when it changes. Only listen addresses, [witness],
+# [telemetry], [control] and [log] need a restart.
+
+# Start in observe: nothing is changed or blocked, everything is recorded.
+# Read `hedge report` for a week, allowlist your own infrastructure, then
+# move to "redact" or "block".
+mode = "observe"
+
+[server]
+# Loopback: TLS ends at the reverse proxy on this host (nginx, Caddy);
+# Hedge itself speaks plain HTTP. Use 0.0.0.0 only if the proxy runs on
+# another machine.
+listen = "127.0.0.1:18765"
+
+# Turn this on as soon as the first client exists (hedge client add <name>).
+# Until then anyone who can reach the proxy can use it – with their own
+# provider credentials, but without a name in the witness.
+# require_client = true
+
+# Requests larger than this get 413. The reverse proxy in front must allow
+# at least as much.
+# max_body_mb = 10
+
+# On SIGTERM, running answers get this long to finish. Keep the stop timeout
+# of the platform (Compose stop_grace_period, systemd TimeoutStopSec,
+# Kubernetes terminationGracePeriodSeconds) a little longer.
+# shutdown_grace_secs = 30
+
+[control]
+token = "/var/lib/hedge/control.token"
+# The control API (status, approvals, witness) on its own port: /_hedge/* is
+# then not reachable on the proxy port at all. The reverse proxy forwards
+# /_hedge/ to this port for the admin network only.
+listen = "127.0.0.1:18766"
+
+[witness]
+path = "/var/lib/hedge/witness.jsonl"
+key = "/var/lib/hedge/witness.key"
+# Close a segment every 64 MiB. Closed segments never change again: archive
+# them, and keep `hedge head` somewhere else.
+rotate_mb = 64
+# The witness holds no prompt text. Two human-readable parts can be switched
+# off if your works council or privacy policy asks for it:
+# tool_preview = false   # first 120 characters of each tool call, secrets masked
+# hints = false          # p…@example.com, …a1b2
+
+[log]
+format = "json"
+
+# Traces and metrics. Without them an outage looks like a quiet afternoon:
+# the alert "no heartbeat" needs the metric hedge_up.
+[telemetry]
+# enabled = true
+# endpoint = "http://lgtm:4318"
+
+[tools]
+# enforce = true
+# For real separation of duties: the call waits until an admin decides.
+# approve_in_chat = false
+# approval_timeout_secs = 300
+# notify_webhook = "https://hooks.slack.com/services/…"
+
+[models]
+# allow = ["claude-*"]
+
+[budget]
+# daily_tokens = 2_000_000    # per client and UTC day
+# session_tokens = 500_000
+
+# Your own infrastructure is not a finding.
+[allow]
+# domains = ["example.com"]
+
+# Names and phone numbers (Presidio). Run the hedge-presidio image next to
+# Hedge (deploy/presidio, bound to loopback) and point Hedge at it. The
+# hardened unit has no access to Docker, so `managed = true` (Hedge starting
+# the container itself) is for laptops, not for this service.
+[presidio]
+# enabled = true
+# url = "http://127.0.0.1:5002"
+# languages = ["de", "en"]
+# enforce = false            # true: mask or block names like built-in findings
+# on_unavailable = "block"   # with enforce: nothing leaves unchecked
+
+# --- people -------------------------------------------------------------
+# hedge client add <name>   one token per developer (or per machine)
+# hedge admin add <name>    one token per admin; approvals carry the name
+#
+# With a read-only config (this file comes from Git): add --print and paste
+# the block here.

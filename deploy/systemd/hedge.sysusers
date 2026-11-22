@@ -1,0 +1,3 @@
+# /usr/lib/sysusers.d/hedge.conf – the service user of Hedge.
+#Type Name  ID  GECOS                    Home
+u     hedge -   "Hedge AI Guard Proxy"   /var/lib/hedge

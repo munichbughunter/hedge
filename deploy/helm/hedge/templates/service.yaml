@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hedge.fullname" . }}
+  labels:
+    {{- include "hedge.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "hedge.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: proxy
+      port: {{ .Values.service.port }}
+      targetPort: proxy
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hedge.fullname" . }}-control
+  labels:
+    {{- include "hedge.labels" . | nindent 4 }}
+  {{- with .Values.control.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.control.service.type }}
+  selector:
+    {{- include "hedge.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: control
+      port: {{ .Values.control.service.port }}
+      targetPort: control
+      protocol: TCP

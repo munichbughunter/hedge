@@ -1,0 +1,69 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "hedge.fullname" . }}
+  labels:
+    {{- include "hedge.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          # Only the proxy Service is behind this host; /_hedge/* does not
+          # exist on its port.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "hedge.fullname" . }}
+                port:
+                  name: proxy
+{{- end }}
+{{- if .Values.controlIngress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "hedge.fullname" . }}-control
+  labels:
+    {{- include "hedge.labels" . | nindent 4 }}
+  {{- with .Values.controlIngress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.controlIngress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.controlIngress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.controlIngress.host | quote }}
+      secretName: {{ .Values.controlIngress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.controlIngress.host | quote }}
+      http:
+        paths:
+          - path: /_hedge/
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "hedge.fullname" . }}-control
+                port:
+                  name: control
+{{- end }}
